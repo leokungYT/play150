@@ -1,0 +1,23 @@
+# Binary files
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Directories with potentially sensitive or large data
+backup/
+backup-id/
+login-fail/
+login-failed/
+login-send/
+lv5+/
+old/
+img/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local config
+configmain.json
+ref.ini
