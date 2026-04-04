@@ -17,6 +17,167 @@ import glob
 from queue import Queue
 import math
 from scanner import HeroScanner
+import customtkinter as ctk
+import colorama
+import ssl
+import threading
+from datetime import datetime
+from tkinter import messagebox
+try:
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+    print("[WARN] customtkinter not found. GUI mode will be disabled. Run 'pip install customtkinter' to enable.")
+
+colorama.init(autoreset=True)
+
+# Fix SSL certificate error for downloading EasyOCR models
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# =========================================================
+# Statistics and GUI Tracking
+# =========================================================
+# ----- Simplified UI Stats Class -----
+class RestartTimeoutError(Exception): pass
+
+class SimpleUIStats:
+    def __init__(self):
+        self.total_files = 0
+        self.successful_logins = 0
+        self.failed_logins = 0
+        self.processed_files = 0
+        self.connected_devices = 0
+        self.lock = threading.RLock()
+        self.last_update = time.time()
+        self.update_interval = 30
+        self.device_statuses = {}
+        self.hero_counts = {}
+        # Counter สำหรับ hero found/not-found
+        self.success_count = 0 # Matches bot success_count
+        self.fail_count = 0    # Matches bot fail_count
+        self.random_fail_count = 0 # Counter for gacha/swap_shop failures
+        # hero found list with counts
+        self.hero_found_list = {}  # {hero_combo: count} e.g. {'Yor': 1, 'Yor+Anya': 2}
+        self.total_login_time = 0.0
+        self.login_time_count = 0
+        
+    def _get_shared_file(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared_stats.json")
+
+    def save_shared(self):
+        """Save stats to a shared file for multi-process sync (Atomic write)"""
+        try:
+            with self.lock:
+                data = {
+                    "success_count": self.success_count,
+                    "fail_count": self.fail_count,
+                    "random_fail_count": self.random_fail_count,
+                    "hero_found_list": self.hero_found_list,
+                    "device_statuses": self.device_statuses,
+                    "last_update": time.time(),
+                    "total_login_time": getattr(self, "total_login_time", 0),
+                    "login_time_count": getattr(self, "login_time_count", 0)
+                }
+                path = self._get_shared_file()
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                # Atomic replace with retry for Windows WinError 32
+                for _ in range(5):
+                    try:
+                        os.replace(tmp_path, path)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+                else:
+                    # Fallback
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+        except Exception as e:
+            print(f"[DEBUG] save_shared error: {e}")
+
+    def load_shared(self):
+        """Load stats from the shared file with retries"""
+        shared_file = self._get_shared_file()
+        if not os.path.exists(shared_file):
+            return
+            
+        for _ in range(5): # Retry up to 5 times
+            try:
+                with open(shared_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if not content: continue
+                    data = json.loads(content)
+                    with self.lock:
+                        # Only update if shared data is newer or to merge
+                        self.success_count = max(self.success_count, data.get("success_count", 0))
+                        self.fail_count = max(self.fail_count, data.get("fail_count", 0))
+                        self.random_fail_count = max(self.random_fail_count, data.get("random_fail_count", 0))
+                        
+                        # Merge hero lists (take max count)
+                        shared_heroes = data.get("hero_found_list", {})
+                        for h, count in shared_heroes.items():
+                            self.hero_found_list[h] = max(self.hero_found_list.get(h, 0), count)
+                            
+                        # Load login times
+                        self.total_login_time = data.get("total_login_time", self.total_login_time)
+                        self.login_time_count = data.get("login_time_count", self.login_time_count)
+                            
+                        # Update device statuses
+                        self.device_statuses.update(data.get("device_statuses", {}))
+                break
+            except Exception as e:
+                time.sleep(0.1)
+
+    def record_login_time(self, duration_sec):
+        self.load_shared()
+        with self.lock:
+            self.total_login_time += duration_sec
+            self.login_time_count += 1
+            self.save_shared()
+
+    def update(self, total=None, processed=None, success=None, fail=None, random_fail=None, devices=None, hero_found=None, hero_not_found=None):
+        self.load_shared() # Pull latest from others first to avoid overwriting counts
+        with self.lock:
+            if total is not None: self.total_files = total
+            if processed is not None: self.processed_files = processed
+            if success is not None: 
+                # For success/fail, we take the max of (local incremented) vs (shared latest)
+                # This is safer than just setting it.
+                self.success_count = max(self.success_count, success)
+            if fail is not None: 
+                self.fail_count = max(self.fail_count, fail)
+            if random_fail is not None:
+                self.random_fail_count = max(self.random_fail_count, random_fail)
+            if devices is not None: self.connected_devices = devices
+            if hero_found is not None: self.success_count += hero_found
+            if hero_not_found is not None: self.fail_count += hero_not_found
+            self.save_shared()
+    
+    def update_device(self, device_serial, status):
+        """Update device status and sync with shared file"""
+        self.load_shared() # Pull latest from others first
+        with self.lock:
+            self.device_statuses[device_serial] = status
+            self.save_shared() # Save merged state back
+    
+    def update_hero(self, hero_name, count=1):
+        """Update hero found count and sync"""
+        self.load_shared() # Pull latest first
+        with self.lock:
+            if hero_name not in self.hero_found_list:
+                self.hero_found_list[hero_name] = 0
+            self.hero_found_list[hero_name] += count
+            self.save_shared()
+
+    def get_hero_combo_stats(self):
+        self.load_shared() # Always refresh before getting
+        with self.lock:
+            return dict(self.hero_found_list)
+
+ui_stats = SimpleUIStats()
+GUI_INSTANCE = None
 
 class AccountFinished(Exception):
     """Raised when an account reached Stage 151 and needs backup/switching."""
@@ -123,7 +284,14 @@ class BotInstance:
         self._checklv_done = False
         self._login_fixid_count = 0
 
+
+    def log(self, message):
+        self.log(f"{message}")
+        if GUI_INSTANCE:
+            GUI_INSTANCE.log_to_device(self.device_id, message)
+
     def load_config(self):
+
         try:
             with open("configmain.json", "r") as f:
                 self.config = json.load(f)
@@ -131,7 +299,7 @@ class BotInstance:
             self.config = {"getclearquest": 0}
 
     def push_file(self, local_path, remote_path="/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml"):
-        print(f"[{self.device_id}] Pushing {local_path} to {remote_path} (Robust Mode)...")
+        self.log(f"Pushing {local_path} to {remote_path} (Robust Mode)...")
         
         # Ensure directories exist
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", "mkdir -p /data/data/com.linecorp.LGRGS/shared_prefs"], **self.kwargs)
@@ -166,9 +334,9 @@ class BotInstance:
         time.sleep(1)
         check = subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", f"ls {remote_path}"], capture_output=True, text=True, **self.kwargs)
         if "_LINE_COCOS_PREF_KEY.xml" in check.stdout:
-            print(f"[{self.device_id}] ✓ Injection confirmed.")
+            self.log(f"✓ Injection confirmed.")
         else:
-            print(f"[{self.device_id}] ✗ Injection FAILED! File not found in target directory.")
+            self.log(f"✗ Injection FAILED! File not found in target directory.")
 
     def pull_file(self, local_path):
         """Pull file from device using login.py's robust method:
@@ -186,29 +354,29 @@ class BotInstance:
                            f"su -c 'chmod 666 {temp_remote}'"], **self.kwargs)
             
             # 3. Pull from temp location
-            print(f"[{self.device_id}] Pulling {src_remote} -> {local_path} (via {temp_remote})...")
+            self.log(f"Pulling {src_remote} -> {local_path} (via {temp_remote})...")
             result = subprocess.run([self.adb_cmd, "-s", self.device_id, "pull", temp_remote, local_path], 
                                    capture_output=True, text=True, **self.kwargs)
             
             if result.returncode == 0:
-                print(f"[{self.device_id}] ✓ File pulled successfully to {local_path}")
+                self.log(f"✓ File pulled successfully to {local_path}")
             else:
-                print(f"[{self.device_id}] ✗ Pull failed: {result.stderr}")
+                self.log(f"✗ Pull failed: {result.stderr}")
             
             # 4. Clean up temp file
             subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
                            f"su -c 'rm -f {temp_remote}'"], **self.kwargs)
                            
         except Exception as e:
-            print(f"[{self.device_id}] Pull file error: {e}")
+            self.log(f"Pull file error: {e}")
             # Fallback: try direct pull with chmod
             try:
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
                                "su", "-c", f"chmod 666 {src_remote}"], **self.kwargs)
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "pull", src_remote, local_path], **self.kwargs)
-                print(f"[{self.device_id}] Fallback pull completed.")
+                self.log(f"Fallback pull completed.")
             except Exception as e2:
-                print(f"[{self.device_id}] Fallback pull also failed: {e2}")
+                self.log(f"Fallback pull also failed: {e2}")
 
     def adb_run(self, cmd_list, timeout=15):
         """Helper to run adb commands with uniform settings"""
@@ -223,14 +391,14 @@ class BotInstance:
             try:
                 # สลับวิธีเปิด: am start กับ monkey
                 if attempt % 2 == 1:
-                    print(f"[{self.device_id}] Opening app via am start (attempt {attempt})...")
+                    self.log(f"Opening app via am start (attempt {attempt})...")
                     self.adb_run([
                         self.adb_cmd, "-s", self.device_id, "shell",
                         "am", "start", "-S", "-n",
                         "com.linecorp.LGRGS/com.linecorp.common.activity.LineActivity"
                     ], timeout=10)
                 else:
-                    print(f"[{self.device_id}] Opening app via monkey (attempt {attempt})...")
+                    self.log(f"Opening app via monkey (attempt {attempt})...")
                     self.adb_run([
                         self.adb_cmd, "-s", self.device_id, "shell",
                         "monkey", "-p", "com.linecorp.LGRGS",
@@ -247,21 +415,21 @@ class BotInstance:
                     pid = ""
                 
                 if pid:
-                    print(f"[{self.device_id}] ✓ App running (PID: {pid}) - attempt {attempt}")
+                    self.log(f"✓ App running (PID: {pid}) - attempt {attempt}")
                     return True
                 else:
-                    print(f"[{self.device_id}] ✗ App crashed/bounced! (attempt {attempt}) Retrying...")
+                    self.log(f"✗ App crashed/bounced! (attempt {attempt}) Retrying...")
                     time.sleep(2)
                     
             except Exception as e:
-                print(f"[{self.device_id}] Error opening app (attempt {attempt}): {e}")
+                self.log(f"Error opening app (attempt {attempt}): {e}")
                 time.sleep(2)
         
-        print(f"[{self.device_id}] Failed to open app after 5 attempts!")
+        self.log(f"Failed to open app after 5 attempts!")
         return False
 
     def main_login(self, current_filename=None):
-        print(f"[{self.device_id}] Starting Main Login...")
+        self.log(f"Starting Main Login...")
         self._login_fixid_count = 0
         
         # Clear app
@@ -269,7 +437,7 @@ class BotInstance:
         time.sleep(2)
         
         if not self.open_app():
-            print(f"[{self.device_id}] Login ABORTED: Failed to open app.")
+            self.log(f"Login ABORTED: Failed to open app.")
             return False
 
         start_time = time.time()
@@ -278,16 +446,16 @@ class BotInstance:
             
             # Check for stoplogin - indicate login finished
             if self.find_image("img/stoplogin.png", threshold=0.8):
-                print(f"[{self.device_id}] Found stoplogin.png! Login complete.")
+                self.log(f"Found stoplogin.png! Login complete.")
                 break
                 
             # --- Persistence Checks for alert2 and fixokk ---
             if self.exists_in_cache("img/alert2.png", threshold=0.8):
                 if not hasattr(self, '_alert2_start_time') or self._alert2_start_time is None:
                     self._alert2_start_time = time.time()
-                    print(f"[{self.device_id}] Detected alert2.png (8s wait to restart)...")
+                    self.log(f"Detected alert2.png (8s wait to restart)...")
                 elif time.time() - self._alert2_start_time >= 8:
-                    print(f"[{self.device_id}] alert2.png persisted 8s! Restarting app/account...")
+                    self.log(f"alert2.png persisted 8s! Restarting app/account...")
                     self._alert2_start_time = None
                     return "restart"
             else:
@@ -296,9 +464,9 @@ class BotInstance:
             if self.exists_in_cache("img/fixokk.png", threshold=0.8):
                 if not hasattr(self, '_fixokk_start_time') or self._fixokk_start_time is None:
                     self._fixokk_start_time = time.time()
-                    print(f"[{self.device_id}] Detected fixokk.png (5s wait to click)...")
+                    self.log(f"Detected fixokk.png (5s wait to click)...")
                 elif time.time() - self._fixokk_start_time >= 5:
-                    print(f"[{self.device_id}] fixokk.png persisted 5s! Clicking...")
+                    self.log(f"fixokk.png persisted 5s! Clicking...")
                     self.click("img/fixokk.png")
                     self._fixokk_start_time = None
             else:
@@ -306,7 +474,7 @@ class BotInstance:
 
             # === fixid1.png → failed ทันที ===
             if self.exists_in_cache("img/fixid1.png", threshold=0.95):
-                print(f"[{self.device_id}] Found fixid1.png! -> login-failed immediately")
+                self.log(f"Found fixid1.png! -> login-failed immediately")
                 self._login_fixid_count = 0
                 self.handle_login_failure()
                 return "failed"
@@ -314,44 +482,44 @@ class BotInstance:
             # === fixid.png Check (เช็คทุกรอบ) -> fikcheck -> refresh -> check ===
             if self.exists_in_cache("img/fixid.png", threshold=0.95):
                 self._login_fixid_count += 1
-                print(f"[{self.device_id}] Found fixid.png ({self._login_fixid_count}/8), fikcheck -> refresh -> check...")
+                self.log(f"Found fixid.png ({self._login_fixid_count}/8), fikcheck -> refresh -> check...")
                 
                 if self._login_fixid_count >= 8:
-                    print(f"[{self.device_id}] fixid limit reached (8 times)! Failing...")
+                    self.log(f"fixid limit reached (8 times)! Failing...")
                     self._login_fixid_count = 0
                     self.handle_login_failure()
                     return "failed"
                 
                 # 1) กด fikcheck
-                print(f"[{self.device_id}] Step 1: waiting for fikcheck.png (10s timeout)...")
+                self.log(f"Step 1: waiting for fikcheck.png (10s timeout)...")
                 time.sleep(1.5) # ให้หน้าจอเสถียรหลัง re-route
                 for _ in range(10): # Timeout 10s
                     self.capture_screen()
                     if self.exists_in_cache("img/fikcheck.png", threshold=0.8):
                         self.click("img/fikcheck.png", threshold=0.8)
-                        print(f"[{self.device_id}] Clicked fikcheck.png")
+                        self.log(f"Clicked fikcheck.png")
                         time.sleep(2)
                         break
                     time.sleep(1)
                 
                 # 2) กด refresh
-                print(f"[{self.device_id}] Step 2: clicking refresh.png (10s timeout)...")
+                self.log(f"Step 2: clicking refresh.png (10s timeout)...")
                 for _ in range(10): # Timeout 10s
                     self.capture_screen()
                     if self.exists_in_cache("img/refresh.png"):
                         self.click("img/refresh.png")
-                        print(f"[{self.device_id}] Clicked refresh.png")
+                        self.log(f"Clicked refresh.png")
                         time.sleep(3)
                         break
                     time.sleep(1)
                 
                 # 3) รอ check.png แล้วกด
-                print(f"[{self.device_id}] Step 3: waiting for check.png (60s timeout)...")
+                self.log(f"Step 3: waiting for check.png (60s timeout)...")
                 check_wait_start = time.time()
                 while time.time() - check_wait_start < 60:
                     self.capture_screen()
                     if self.exists_in_cache("img/check.png"):
-                        print(f"[{self.device_id}] Found check.png! Clicking...")
+                        self.log(f"Found check.png! Clicking...")
                         self.click("img/check.png")
                         time.sleep(2)
                         # หลังกด check -> รอดู fixid ก่อน 2 วิ
@@ -359,7 +527,7 @@ class BotInstance:
                         for _ in range(2):
                             self.capture_screen()
                             if self.exists_in_cache("img/fixid.png"):
-                                print(f"[{self.device_id}] Found fixid.png right after check! Re-routing...")
+                                self.log(f"Found fixid.png right after check! Re-routing...")
                                 found_fixid_after_check = True
                                 break
                             time.sleep(1)
@@ -368,7 +536,7 @@ class BotInstance:
                             break
 
                         if self.exists_in_cache("img/fikcheck.png", threshold=0.8):
-                            print(f"[{self.device_id}] Found fikcheck.png after check! Clicking...")
+                            self.log(f"Found fikcheck.png after check! Clicking...")
                             self.click("img/fikcheck.png", threshold=0.8)
                             time.sleep(1)
                         break
@@ -378,7 +546,7 @@ class BotInstance:
 
             # === เจอ refresh.png (ไม่มี fixid) -> กด refresh -> check ===
             if self.exists_in_cache("img/refresh.png"):
-                print(f"[{self.device_id}] Found refresh.png (no fixid), clicking refresh -> check...")
+                self.log(f"Found refresh.png (no fixid), clicking refresh -> check...")
                 self.click("img/refresh.png")
                 time.sleep(3)
                 
@@ -386,7 +554,7 @@ class BotInstance:
                 while time.time() - check_wait_start < 60:
                     self.capture_screen()
                     if self.exists_in_cache("img/check.png"):
-                        print(f"[{self.device_id}] Found check.png! Clicking...")
+                        self.log(f"Found check.png! Clicking...")
                         self.click("img/check.png")
                         time.sleep(2)
                         # หลังกด check -> รอดู fixid ก่อน 2 วิ
@@ -394,7 +562,7 @@ class BotInstance:
                         for _ in range(2):
                             self.capture_screen()
                             if self.exists_in_cache("img/fixid.png"):
-                                print(f"[{self.device_id}] Found fixid.png right after check! Re-routing...")
+                                self.log(f"Found fixid.png right after check! Re-routing...")
                                 found_fixid_after_check = True
                                 break
                             time.sleep(1)
@@ -405,7 +573,7 @@ class BotInstance:
                         # หลังกด check -> หา fixok ด้วย
                         self.capture_screen()
                         if self.exists_in_cache("img/fixok.png"):
-                            print(f"[{self.device_id}] Found fixok.png after check! Clicking...")
+                            self.log(f"Found fixok.png after check! Clicking...")
                             self.click("img/fixok.png")
                             time.sleep(1)
                         break
@@ -416,10 +584,10 @@ class BotInstance:
             # Handle event sequence if found
             pos_ev = self.find_image("img/event.png", threshold=0.8)
             if pos_ev:
-                print(f"[{self.device_id}] Found event.png, handling...")
+                self.log(f"Found event.png, handling...")
                 self.tap(pos_ev[0], pos_ev[1])
                 time.sleep(1)
-                back_count = 0
+                back_count: int = 0
                 while not self.find_image("img/cancel.png") and back_count < 10:
                     self.press_back()
                     time.sleep(1)
@@ -435,7 +603,7 @@ class BotInstance:
                     time.sleep(1)
 
             if time.time() - start_time > 480: # 8 min timeout
-                print(f"[{self.device_id}] Main login timeout.")
+                self.log(f"Main login timeout.")
                 return False
             time.sleep(1.5)
         return True
@@ -447,7 +615,7 @@ class BotInstance:
         fname = self.current_account or "failed_unknown.xml"
         dst_path = os.path.join(dst_dir, fname)
         
-        print(f"[{self.device_id}] FAILED LOGIN! Salvaging session to {dst_path}...")
+        self.log(f"FAILED LOGIN! Salvaging session to {dst_path}...")
         self.pull_file(dst_path)
         
         # Clear app immediately
@@ -463,7 +631,7 @@ class BotInstance:
             try:
                 p_res = subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "pidof", "com.linecorp.LGRGS"], capture_output=True, timeout=5, **self.kwargs)
                 if not p_res.stdout.strip():
-                    print(f"[{self.device_id}] !!! GAME CRASHED (PID MISSING) !!! Triggering Recovery...")
+                    self.log(f"!!! GAME CRASHED (PID MISSING) !!! Triggering Recovery...")
                     raise GameCrashed()
             except GameCrashed:
                 raise # Re-raise to be caught by run_step1
@@ -476,7 +644,7 @@ class BotInstance:
             try:
                 self.check_floating_popups()
             except Exception as e:
-                print(f"[{self.device_id}] Popup check error: {e}")
+                self.log(f"Popup check error: {e}")
             finally:
                 self._in_popup_check = False
 
@@ -491,25 +659,25 @@ class BotInstance:
                 self.screen_gray = cv2.cvtColor(self.screen_bgr, cv2.COLOR_BGR2GRAY)
                 return True
         except Exception as e:
-            print(f"[{self.device_id}] Capture error: {e}")
+            self.log(f"Capture error: {e}")
         return False
 
     def tap(self, x, y, label=None):
         if label:
-            print(f"[{self.device_id}] Tapping {label} at ({x}, {y})")
+            self.log(f"Tapping {label} at ({x}, {y})")
         else:
-            print(f"[{self.device_id}] Tapping screen...")
+            self.log(f"Tapping screen...")
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "tap", str(x), str(y)], **self.kwargs)
 
     def press_back(self):
-        print(f"[{self.device_id}] Pressing BACK (ADB shell KEYCODE_BACK)")
+        self.log(f"Pressing BACK (ADB shell KEYCODE_BACK)")
         subprocess.run(
             [self.adb_cmd, "-s", self.device_id, "shell", "input", "keyevent", "KEYCODE_BACK"],
             **self.kwargs
         )
 
     def swipe(self, x1, y1, x2, y2, duration=1000):
-        print(f"[{self.device_id}] Dragging from ({x1}, {y1}) to ({x2}, {y2}) over {duration}ms...")
+        self.log(f"Dragging from ({x1}, {y1}) to ({x2}, {y2}) over {duration}ms...")
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration)], **self.kwargs)
 
     def find_image(self, template_path, threshold=0.8):
@@ -552,7 +720,7 @@ class BotInstance:
 
             if time.time() - last_log > 5:
                 rem = int(timeout - (time.time() - start))
-                print(f"[{self.device_id}]   ...searching for {img_name} ({rem}s remaining of {timeout}s)")
+                self.log(f"...searching for {img_name} ({rem}s remaining of {timeout}s)")
                 last_log = time.time()
 
             time.sleep(1)
@@ -590,7 +758,7 @@ class BotInstance:
                     self.screen_gray = cv2.cvtColor(self.screen_bgr, cv2.COLOR_BGR2GRAY)
                 return True
         except Exception as e:
-            print(f"[{self.device_id}] Raw capture error: {e}")
+            self.log(f"Raw capture error: {e}")
         return False
 
     def check_floating_popups(self):
@@ -604,7 +772,7 @@ class BotInstance:
             
             # checkline.png: Handle Checkbox Popup Sequence
             if self.exists_in_cache("img/checkline.png"):
-                print(f"[{self.device_id}] [POPUP] checkline.png detected! Running special sequence...")
+                self.log(f"[POPUP] checkline.png detected! Running special sequence...")
                 self.click("img/checkline.png")
                 time.sleep(2)
                 found_any = True
@@ -614,12 +782,12 @@ class BotInstance:
                 while time.time() - start_l1 < 60:
                     self._raw_capture()
                     if self.exists_in_cache("img/check-l1.png"):
-                        print(f"[{self.device_id}] [POPUP] Found check-l1.png")
+                        self.log(f"[POPUP] Found check-l1.png")
                         break
                     time.sleep(1)
                 
                 # Coordinate taps based on newer system
-                print(f"[{self.device_id}] [POPUP] Tapping checkbox coordinates (932,133), (930,253), (926,327)...")
+                self.log(f"[POPUP] Tapping checkbox coordinates (932,133), (930,253), (926,327)...")
                 self.tap(932, 133); time.sleep(5)
                 self.tap(930, 253); time.sleep(5)
                 self.tap(926, 327); time.sleep(5)
@@ -634,19 +802,19 @@ class BotInstance:
                     time.sleep(1)
                 
                 # Final OK
-                print(f"[{self.device_id}] [POPUP] Waiting for check-ok1.png...")
+                self.log(f"[POPUP] Waiting for check-ok1.png...")
                 for _ in range(60):
                     self._raw_capture()
                     if self.exists_in_cache("img/check-ok1.png"):
                         self.click("img/check-ok1.png")
-                        print(f"[{self.device_id}] [POPUP] checkline done.")
+                        self.log(f"[POPUP] checkline done.")
                         time.sleep(2)
                         break
                     time.sleep(1)
 
             # fixnetv2.png: Network/Retry Sequence
             if self.exists_in_cache("img/fixnetv2.png"):
-                print(f"[{self.device_id}] [POPUP] fixnetv2.png detected! Executing retry clicks...")
+                self.log(f"[POPUP] fixnetv2.png detected! Executing retry clicks...")
                 self.click("img/fixnetv2.png")
                 time.sleep(3)
                 self.click("img/fixnetv2ok.png")
@@ -655,31 +823,31 @@ class BotInstance:
 
             # fixplay.png: Google Play Popup
             if self.exists_in_cache("img/fixplay.png"):
-                print(f"[{self.device_id}] [POPUP] fixplay.png detected! Clicking OK...")
+                self.log(f"[POPUP] fixplay.png detected! Clicking OK...")
                 self.click("img/ok.png")
                 time.sleep(2)
                 found_any = True
 
             # fixnet.png: General Connection Error
             if self.exists_in_cache("img/fixnet.png"):
-                print(f"[{self.device_id}] [POPUP] fixnet.png detected! Clicking OK Reset...")
+                self.log(f"[POPUP] fixnet.png detected! Clicking OK Reset...")
                 self.click("img/oknet.png")
                 time.sleep(2)
                 found_any = True
 
             # fixnet1.png: Secondary Connection Error
             if self.exists_in_cache("img/fixnet1.png"):
-                print(f"[{self.device_id}] [POPUP] fixnet1.png detected! Tapping (476, 394)...")
+                self.log(f"[POPUP] fixnet1.png detected! Tapping (476, 394)...")
                 self.tap(476, 394)
                 time.sleep(2)
                 found_any = True
 
             # fixnetv3.png: Force Restart Loop
             if self.exists_in_cache("img/fixnetv3.png"):
-                print(f"[{self.device_id}] [POPUP] fixnetv3.png detected! Incrementing restart count...")
+                self.log(f"[POPUP] fixnetv3.png detected! Incrementing restart count...")
                 self._fixnetv3_count += 1
                 if self._fixnetv3_count >= 3:
-                    print(f"[{self.device_id}] [RESTART] Hit 3x fixnetv3.png! Forcing bot restart...")
+                    self.log(f"[RESTART] Hit 3x fixnetv3.png! Forcing bot restart...")
                     self._need_restart = True
                     self._fixnetv3_count = 0
                 self.click("img/fixnetv3.png")
@@ -691,7 +859,7 @@ class BotInstance:
                 skip_lv = self.config.get("skip-lv", 0)
                 if skip_lv == 1 and not getattr(self, "_checklv_done", False):
                     if self.exists_in_cache("img/checkpont-lv.png"):
-                        print(f"[{self.device_id}] [CHECK-LV] Target found! Verifying level...")
+                        self.log(f"[CHECK-LV] Target found! Verifying level...")
                         self._checklv_done = True
                         
                         # OCR Region: 25, 17, 81, 74
@@ -714,9 +882,9 @@ class BotInstance:
                                     break
                         
                         if found_lv is not None:
-                            print(f"[{self.device_id}] [CHECK-LV] Detected Level: {found_lv}")
+                            self.log(f"[CHECK-LV] Detected Level: {found_lv}")
                             if found_lv > 4:
-                                print(f"[{self.device_id}] [CHECK-LV] Level {found_lv} > 4! Moving account to lv5+ and stopping.")
+                                self.log(f"[CHECK-LV] Level {found_lv} > 4! Moving account to lv5+ and stopping.")
                                 # Move file
                                 if self.current_account:
                                     source = os.path.join("backup", self.current_account)
@@ -725,17 +893,17 @@ class BotInstance:
                                     dest = os.path.join(dest_dir, self.current_account)
                                     try:
                                         shutil.move(source, dest)
-                                        print(f"[{self.device_id}] Account moved to {dest}")
+                                        self.log(f"Account moved to {dest}")
                                     except Exception as e:
-                                        print(f"[{self.device_id}] Error moving account: {e}")
+                                        self.log(f"Error moving account: {e}")
                                 
                                 # Force Stop and Exit
                                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
                                 raise AccountFinished()
                             else:
-                                print(f"[{self.device_id}] [CHECK-LV] Level {found_lv} <= 4. Continuing normally.")
+                                self.log(f"[CHECK-LV] Level {found_lv} <= 4. Continuing normally.")
                         else:
-                            print(f"[{self.device_id}] [CHECK-LV] Could not read level. Skipping for now.")
+                            self.log(f"[CHECK-LV] Could not read level. Skipping for now.")
                             self._checklv_done = False # Try again later if still on screen
 
                 break
@@ -747,7 +915,7 @@ class BotInstance:
         Stage 151 reached! Force stop app, pull account XML,
         save as stage151_OriginalName.xml in backup-id/, then signal finish.
         """
-        print(f"[{self.device_id}] >>> STAGE 151 QUEST ROUTINE STARTED <<<")
+        self.log(f">>> STAGE 151 QUEST ROUTINE STARTED <<<")
         
         # 1. Force Stop Game
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
@@ -764,16 +932,16 @@ class BotInstance:
         
         # 3. Pull File
         remote_path = "/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml"
-        print(f"[{self.device_id}] Backing up account to {dest_path}...")
+        self.log(f"Backing up account to {dest_path}...")
         # Fix permissions before pulling
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", f"chmod 666 {remote_path}"], **self.kwargs)
         subprocess.run([self.adb_cmd, "-s", self.device_id, "pull", remote_path, dest_path], **self.kwargs)
         
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
-            print(f"[{self.device_id}] Backup successful: {dest_filename}")
+            self.log(f"Backup successful: {dest_filename}")
             return False # Return False to signal AccountFinished (Stop current work on this ID)
         else:
-            print(f"[{self.device_id}] ERROR: Backup failed / File missing!")
+            self.log(f"ERROR: Backup failed / File missing!")
             return False # Still return False to stop trying this account as it might be stuck
 
     def _get_lock_path(self, xml_file):
@@ -848,7 +1016,7 @@ class BotInstance:
             try:
                 import easyocr
                 if self._ocr_reader is None:
-                    print(f"[{self.device_id}] Initializing EasyOCR...")
+                    self.log(f"Initializing EasyOCR...")
                     self._ocr_reader = easyocr.Reader(['en'], gpu=False)
 
                 if region:
@@ -861,7 +1029,7 @@ class BotInstance:
                     numbers_found = re.findall(r'\d+', text)
 
                     if conf > 0.2:
-                        print(f"[{self.device_id}] OCR Read: '{text}' (conf: {conf:.2f}) (Digits: {numbers_found})")
+                        self.log(f"OCR Read: '{text}' (conf: {conf:.2f}) (Digits: {numbers_found})")
 
                     for target_text in text_list:
                         if target_text.isdigit():
@@ -870,33 +1038,33 @@ class BotInstance:
                                 center_x = int((tl[0] + br[0]) / 2 / 2) + rx
                                 center_y = int((tl[1] + br[1]) / 2 / 2) + ry
 
-                                print(f"[{self.device_id}] => Found '{target_text}', clicking at ({center_x}, {center_y})...")
+                                self.log(f"=> Found '{target_text}', clicking at ({center_x}, {center_y})...")
                                 self.tap(center_x, center_y)
                                 return True
             except Exception as e:
-                print(f"[{self.device_id}] OCR Error: {e}")
+                self.log(f"OCR Error: {e}")
 
             time.sleep(1)
         return False
 
     def advanced_drag_hold(self, points, hold_sec=3):
         p1, p2, p3 = points
-        print(f"[{self.device_id}]   [Double-Drag Hold] Phase 1: {p1}->{p2} (Release)")
+        self.log(f"[Double-Drag Hold] Phase 1: {p1}->{p2} (Release)")
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe",
                         str(p1[0]), str(p1[1]), str(p2[0]), str(p2[1]), "500"], **self.kwargs)
         time.sleep(1.0)
-        print(f"[{self.device_id}]   [Double-Drag Hold] Phase 2: DragAndDrop {p2} -> {p3} (Focusing Hold)")
+        self.log(f"[Double-Drag Hold] Phase 2: DragAndDrop {p2} -> {p3} (Focusing Hold)")
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "draganddrop",
                         str(p2[0]), str(p2[1]), str(p3[0]), str(p3[1]), str(hold_sec*1000)], **self.kwargs)
 
     def handle_clear_routine(self, stage_num):
         """Standardized Master Clear Routine (Deep Reward Edition)"""
-        print(f"[{self.device_id}]   Starting clear sequence (Stage {stage_num})...")
+        self.log(f"Starting clear sequence (Stage {stage_num})...")
 
         def wc(img, timeout=3): return self.wait_and_click(img, timeout=timeout)
         
         def reward_sweep(label="Reward Sweep", timeout_idle=10):
-            print(f"[{self.device_id}]   {label}: Searching for all reward items...")
+            self.log(f"{label}: Searching for all reward items...")
             reward_items = [
                 "clear1.png", "clear2.png", "clear3.png", "clearok.png",
                 "itemstage.png", "okpuzzle.png", "ozpuzzle.png", "clear lv.png", "clearstop.png"
@@ -914,13 +1082,13 @@ class BotInstance:
                         time.sleep(0.4)
                         break 
                 if not found_any: time.sleep(0.5)
-            print(f"[{self.device_id}]   {label} finished.")
+            self.log(f"{label} finished.")
 
         # ============================================================
         # STAGE 5 (High Priority - Exact Sequential Logic)
         # ============================================================
         if stage_num == 5:
-            print(f"[{self.device_id}] Stage 5: Starting 100% Exact Sequential Logic...")
+            self.log(f"Stage 5: Starting 100% Exact Sequential Logic...")
             
             # 1. clear1-> clear2 -> skip -> skipok
             wc("img/clear1.png", 15); wc("img/clear2.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
@@ -939,7 +1107,7 @@ class BotInstance:
             wc("img/chest1.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
             
             # 6. Loop eventstage5: Wait 10s, if found click, repeat until not found for 10s
-            print(f"[{self.device_id}]   Stage 5: Checking for eventstage5.png (10s window)...")
+            self.log(f"Stage 5: Checking for eventstage5.png (10s window)...")
             while True:
                 if wc("img/eventstage5.png", 15):
                     time.sleep(1)
@@ -947,7 +1115,7 @@ class BotInstance:
                     break
             
             # 7. skip (search indefinitely until found) -> skipok 30s -> skip 30s -> skipok 30s
-            print(f"[{self.device_id}]   Stage 5: Waiting indefinitely for skip.png...")
+            self.log(f"Stage 5: Waiting indefinitely for skip.png...")
             while not wc("img/skip.png", 15): pass
             wc("img/skipok.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
             
@@ -957,23 +1125,23 @@ class BotInstance:
             # 9. mainstage -> wait for waitmainstage.png -> KEYCODE_BACK
             wc("img/mainstage.png", 15)
             if self.wait_for_image("img/waitmainstage.png", timeout=60):
-                print(f"[{self.device_id}]   Found waitmainstage, sending Keycode Back...")
+                self.log(f"Found waitmainstage, sending Keycode Back...")
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "keyevent", "KEYCODE_BACK"], **self.kwargs)
                 time.sleep(1)
             
             # 10. Final eventstage5 check (10s) -> mainstage
             wc("img/eventstage5.png", 15); wc("img/mainstage.png", 15)
             
-            print(f"[{self.device_id}] Stage 5 Sequence 100% Completed.")
+            self.log(f"Stage 5 Sequence 100% Completed.")
             return True
 
         # ============================================================
         # STAGE 12 (Strict Exact Logic - WITH INITIAL SWEEP)
         # ============================================================
         if stage_num == 12:
-            print(f"[{self.device_id}] Stage 12: First Full Clearing...")
+            self.log(f"Stage 12: First Full Clearing...")
             reward_sweep("Initial Sweep")
-            print(f"[{self.device_id}] Stage 12: Starting Exact Sequential Logic...")
+            self.log(f"Stage 12: Starting Exact Sequential Logic...")
             
             # -> eventstage11 30s -> skip -> skipok
             wc("img/eventstage11.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
@@ -1008,28 +1176,28 @@ class BotInstance:
             wc("img/backgearep1.png", 15)
             wc("img/mainstage.png", 15)
             
-            print(f"[{self.device_id}] Stage 12 Sequence 100% Completed.")
+            self.log(f"Stage 12 Sequence 100% Completed.")
             return True
 
         # ============================================================
         # STAGE 15 (Exact Sequential Logic + Initial Sweep)
         # ============================================================
         if stage_num == 15:
-            print(f"[{self.device_id}] Stage 15: First Full Clearing...")
+            self.log(f"Stage 15: First Full Clearing...")
             reward_sweep("Initial Sweep")
-            print(f"[{self.device_id}] Stage 15: Starting Exact Sequential Logic...")
+            self.log(f"Stage 15: Starting Exact Sequential Logic...")
             wc("img/skip.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
             # Loop egear1 -> 5 indefinitely until found, then tap until gone
             last_eg5_pos = None
             for img_name in ["egear1.png", "egear2.png", "egear3.png", "egear4.png", "egear5.png"]:
-                print(f"[{self.device_id}]   Waiting indefinitely for {img_name}...")
+                self.log(f"Waiting indefinitely for {img_name}...")
                 while True:
                     self.capture_screen()
                     p = self.find_image(f"img/{img_name}", 0.8)
                     if p: break
                     time.sleep(0.5)
 
-                print(f"[{self.device_id}]   Found {img_name}, looping until gone...")
+                self.log(f"Found {img_name}, looping until gone...")
                 while True:
                     self.capture_screen()
                     p = self.find_image(f"img/{img_name}", 0.8)
@@ -1040,7 +1208,7 @@ class BotInstance:
                     break
             # 8 extra taps on egear5 position
             if last_eg5_pos:
-                print(f"[{self.device_id}]   Delaying 2s before eg5 extra taps...")
+                self.log(f"Delaying 2s before eg5 extra taps...")
                 time.sleep(2)
                 for _ in range(8): 
                     self.tap(last_eg5_pos[0], last_eg5_pos[1], label="eg5-repeat")
@@ -1049,7 +1217,7 @@ class BotInstance:
             wc("img/skip.png", 15); wc("img/skipok.png", 15)
 
             # Loop backegear until gone
-            print(f"[{self.device_id}]   Looping backegear.png until gone...")
+            self.log(f"Looping backegear.png until gone...")
             while True:
                 self.capture_screen()
                 pb = self.find_image("img/backegear.png", 0.8)
@@ -1062,13 +1230,13 @@ class BotInstance:
         # INITIAL REWARD COLLECTION (For all other NORMAL stages)
         # ============================================================
         if stage_num == 27:
-            print(f"[{self.device_id}] Stage 27 special: Waiting 15s before starting clear sweep...")
+            self.log(f"Stage 27 special: Waiting 15s before starting clear sweep...")
             time.sleep(15)
             
         reward_sweep("Initial Sweep")
 
         if stage_num == 10:
-            print(f"[{self.device_id}] Stage 10: Starting update and finishing flow...")
+            self.log(f"Stage 10: Starting update and finishing flow...")
             wc("img/skip.png", 15); wc("img/skipok.png", 15)
             
             while True:
@@ -1078,7 +1246,7 @@ class BotInstance:
                 if u2: self.tap(u2[0], u2[1], label="update2"); continue
                 pos_drag = self.find_image("img/drag1.png", threshold=0.85)
                 if pos_drag:
-                    print(f"[{self.device_id}]   Found drag1 at {pos_drag}, Sweeping from 99, 447 to 395, 259 (800ms)...")
+                    self.log(f"Found drag1 at {pos_drag}, Sweeping from 99, 447 to 395, 259 (800ms)...")
                     subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", "99", "447", "395", "259", "800"], **self.kwargs)
                     time.sleep(1); break
                 time.sleep(1)
@@ -1086,13 +1254,13 @@ class BotInstance:
             # Click update3 and repeat slowly (6 reps with 2s delay)
             p_u3 = self.wait_and_click("img/update3.png", timeout=20)
             if p_u3:
-                print(f"[{self.device_id}] Clicking update3 repeats (Slower: 2s delay)...")
+                self.log(f"Clicking update3 repeats (Slower: 2s delay)...")
                 for _ in range(5): 
                     time.sleep(2.0)
                     self.tap(p_u3[0], p_u3[1], label="update3-repeat")
             
             # Finishing Flow (Ensuring it gets back to map for Stage 11)
-            print(f"[{self.device_id}] Stage 10: Executing finishing sequence...")
+            self.log(f"Stage 10: Executing finishing sequence...")
             wc("img/skip.png", 15); wc("img/skipok.png", 15)
             wc("img/updateback.png", 15); wc("img/mainstage.png", 15)
             
@@ -1118,7 +1286,7 @@ class BotInstance:
             is_critical = item.get("critical", False)
             max_clicks = item.get("max_clicks", 5)
 
-            print(f"[{self.device_id}]   SeqWait for {img_name}... (Timeout: {to or 'Infinite'})")
+            self.log(f"SeqWait for {img_name}... (Timeout: {to or 'Infinite'})")
             start_wait = time.time()
             found = False
             while True:
@@ -1132,12 +1300,12 @@ class BotInstance:
                 time.sleep(0.5)
             
             if not found:
-                print(f"[{self.device_id}]     {img_name} not found, skipping.")
+                self.log(f"{img_name} not found, skipping.")
                 if is_critical:
                     return False
                 continue
             
-            print(f"[{self.device_id}]     Found {img_name}! Executing '{'loop-click' if is_loop else 'single-click'}'...")
+            self.log(f"Found {img_name}! Executing '{'loop-click' if is_loop else 'single-click'}'...")
             clicks = 0
             while True:
                 self.capture_screen()
@@ -1149,7 +1317,7 @@ class BotInstance:
                 clicks += 1
                 
                 if max_clicks and clicks >= max_clicks:
-                    print(f"[{self.device_id}]     Max clicks ({max_clicks}) reached for {img_name} ({clicks}/{max_clicks}).")
+                    self.log(f"Max clicks ({max_clicks}) reached for {img_name} ({clicks}/{max_clicks}).")
                     break
                 
                 if not is_loop:
@@ -1165,7 +1333,7 @@ class BotInstance:
             g_quest = self.config.get("getclearquest", 0)
 
             if g_quest == 0:
-                print(f"[{self.device_id}] >>> STAGE 151 DETECTED: AUTO-BACKUP & SWITCH (getclearquest=0) <<<")
+                self.log(f">>> STAGE 151 DETECTED: AUTO-BACKUP & SWITCH (getclearquest=0) <<<")
                 
                 # 1. Clear Game
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
@@ -1177,13 +1345,13 @@ class BotInstance:
                 orig_name = self.current_account or "unknown.xml"
                 dest_path = os.path.join(backup_dir, f"stage151_{orig_name}")
                 
-                print(f"[{self.device_id}] Backup Mode (getclearquest: 0) -> Pulling Account to {dest_path}...")
+                self.log(f"Backup Mode (getclearquest: 0) -> Pulling Account to {dest_path}...")
                 self.pull_file(dest_path)
-                print(f"[{self.device_id}] Account saved. Switching to next ID.")
+                self.log(f"Account saved. Switching to next ID.")
                 return False # Signal to break per-account loop
             
             else:
-                print(f"[{self.device_id}] >>> STAGE 151 QUEST ROUTINE STARTED (getclearquest=1) <<<")
+                self.log(f">>> STAGE 151 QUEST ROUTINE STARTED (getclearquest=1) <<<")
                 
                 # Initial setup (Using timeout=99999 from user snippet)
                 self.wait_and_click("img/quest-stage1.png", timeout=99999)
@@ -1191,13 +1359,13 @@ class BotInstance:
                 self.wait_and_click("img/okquest.png", timeout=99999)
 
                 # Play 1 Quest
-                print(f"[{self.device_id}]   Processing Play 1 Quest...")
+                self.log(f"Processing Play 1 Quest...")
                 self.wait_and_click("img/goquse1.png", timeout=99999)
                 pos_pq1 = self.wait_and_click("img/playques1.png", timeout=99999)
                 if pos_pq1:
                     self.tap(pos_pq1[0], pos_pq1[1], label="playques1_rep")
                 
-                print(f"[{self.device_id}]   Delaying 3s then tapping coord 125,29 & 393,449...")
+                self.log(f"Delaying 3s then tapping coord 125,29 & 393,449...")
                 time.sleep(3)
                 self.tap(125, 29, label="coord_125_29")
                 time.sleep(1)
@@ -1207,7 +1375,7 @@ class BotInstance:
                 for q_img in ["img/playquest2.png", "img/playquest3.png", "img/playquest4.png"]:
                     self.wait_and_click(q_img, timeout=99999)
 
-                print(f"[{self.device_id}]   Executing quest swipe...")
+                self.log(f"Executing quest swipe...")
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", "99", "447", "395", "259", "800"], **self.kwargs)
                 time.sleep(1)
 
@@ -1215,8 +1383,8 @@ class BotInstance:
                 self.wait_and_click("img/playquest6.png", timeout=99999)
 
                 # Play 2 Quest
-                print(f"[{self.device_id}]   Processing Play 2 Quest sequence...")
-                print(f"[{self.device_id}]   Tapping coordinate 282, 196 twice...")
+                self.log(f"Processing Play 2 Quest sequence...")
+                self.log(f"Tapping coordinate 282, 196 twice...")
                 for _ in range(2):
                     self.tap(282, 196, label="coord_282_196")
                     time.sleep(0.5)
@@ -1228,13 +1396,13 @@ class BotInstance:
                 self.wait_and_click("img/okquest.png", timeout=99999)
                 self.wait_and_click("img/goquse1.png", timeout=99999)
                 
-                print(f"[{self.device_id}] >>> STAGE 151 QUEST ROUTINE FINISHED <<<")
+                self.log(f">>> STAGE 151 QUEST ROUTINE FINISHED <<<")
                 return True
         finally:
             self.in_quest_routine = False
 
     def handle_battle_31(self):
-        print(f"[{self.device_id}] >>> Phase 2: Battle 31+ System...")
+        self.log(f">>> Phase 2: Battle 31+ System...")
         
         # 1. Burst start
         hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
@@ -1244,7 +1412,7 @@ class BotInstance:
             time.sleep(0.1)
 
         # 2. Priority Position 7
-        print(f"[{self.device_id}]   Priority Position 7 (50, 43) x5 FIRST")
+        self.log(f"Priority Position 7 (50, 43) x5 FIRST")
         for _ in range(5):
             self.tap(50, 43, label="priority_pos7")
             time.sleep(0.1)
@@ -1266,7 +1434,7 @@ class BotInstance:
             
             # Check for stage151 interrupt
             if self.find_image("img/stage151.png", threshold=0.95):
-                print(f"[{self.device_id}] Interrupt: Stage 151 detected in battle!")
+                self.log(f"Interrupt: Stage 151 detected in battle!")
                 stop_spam = True
                 spam_thread.join()
                 if not self.handle_quest_151():
@@ -1282,7 +1450,7 @@ class BotInstance:
 
             self.capture_screen()
             if self.find_image("img/win.png"):
-                print(f"[{self.device_id}] WIN detected!")
+                self.log(f"WIN detected!")
                 stop_spam = True
                 win_detected = True
                 break
@@ -1292,7 +1460,7 @@ class BotInstance:
         return True, "win"
 
     def handle_finish_31(self):
-        print(f"[{self.device_id}] >>> Phase 3: Finish & Rewards (Priority Loop)...")
+        self.log(f">>> Phase 3: Finish & Rewards (Priority Loop)...")
         
         start_time = time.time()
         while time.time() - start_time < 60:
@@ -1308,17 +1476,17 @@ class BotInstance:
             if pos_ns:
                 time.sleep(0.5)
                 self.tap(pos_ns[0], pos_ns[1], label="nextstage_repeat")
-                print(f"[{self.device_id}]   !!! FLOATING NEXTSTAGE DETECTED !!! Tapping reward pos 218, 46 x6...")
+                self.log(f"!!! FLOATING NEXTSTAGE DETECTED !!! Tapping reward pos 218, 46 x6...")
                 for _ in range(6):
                     time.sleep(2.0)
                     self.tap(218, 46)
-                print(f"[{self.device_id}]   Bypassing the rest of the clear sequence.")
+                self.log(f"Bypassing the rest of the clear sequence.")
                 return "jump"
 
             # Check for NextNew
             pos_nn = self.find_image("img/nextnew.png", threshold=0.8)
             if pos_nn:
-                print(f"[{self.device_id}]   !!! FLOATING NEXTNEW DETECTED !!! Tapping 162, 32 -> Jump.")
+                self.log(f"!!! FLOATING NEXTNEW DETECTED !!! Tapping 162, 32 -> Jump.")
                 self.tap(pos_nn[0], pos_nn[1])
                 self.tap(162, 32)
                 time.sleep(1)
@@ -1339,7 +1507,7 @@ class BotInstance:
             
             if not found_any:
                 if self.find_image("img/side.png") or self.find_image("img/buyhelp.png"):
-                    print(f"[{self.device_id}]   Detected map elements. Finishing Phase 3.")
+                    self.log(f"Detected map elements. Finishing Phase 3.")
                     break
                 time.sleep(0.5)
                 
@@ -1375,70 +1543,70 @@ class BotInstance:
 
         scanner = HeroScanner(DeviceWrapper(self))
 
-        print(f"[{self.device_id}] ==================================================")
-        print(f"[{self.device_id}]   FIND TEAM - START")
-        print(f"[{self.device_id}] ==================================================")
+        self.log(f"==================================================")
+        self.log(f"FIND TEAM - START")
+        self.log(f"==================================================")
 
-        print(f"[{self.device_id}] STEP 1: Clicking [team]...")
+        self.log(f"STEP 1: Clicking [team]...")
         while not self.wait_and_click("img/team.png", timeout=60, threshold=0.8):
             time.sleep(1)
 
         time.sleep(1)
 
-        print(f"[{self.device_id}] STEP 2: Waiting for [waitteam]...")
+        self.log(f"STEP 2: Waiting for [waitteam]...")
         while True:
             if self.wait_for_image("img/waitteam.png", timeout=60, threshold=0.8):
-                print(f"[{self.device_id}] waitteam found! Proceeding...")
+                self.log(f"waitteam found! Proceeding...")
                 break
-            print(f"[{self.device_id}] waitteam not found yet, retrying...")
+            self.log(f"waitteam not found yet, retrying...")
             time.sleep(1)
         time.sleep(1)
 
-        print(f"[{self.device_id}] STEP 3: Clearing all hero slots...")
+        self.log(f"STEP 3: Clearing all hero slots...")
         for i, slot in enumerate(HERO_SLOTSCLear):
-            print(f"[{self.device_id}]   Clearing hero{i+1}: ({slot[0]}, {slot[1]}) -> ({CLEAR_DROP[0]}, {CLEAR_DROP[1]})")
+            self.log(f"Clearing hero{i+1}: ({slot[0]}, {slot[1]}) -> ({CLEAR_DROP[0]}, {CLEAR_DROP[1]})")
             subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe",
                             str(slot[0]), str(slot[1]), str(CLEAR_DROP[0]), str(CLEAR_DROP[1]), "500"], **self.kwargs)
             time.sleep(0.3)
         time.sleep(0.5)
 
-        print(f"[{self.device_id}] STEP 4: Applying filters...")
+        self.log(f"STEP 4: Applying filters...")
         filters = ["img/filter1.png", "img/filter2.png", "img/filter3.png", "img/filter4.png", "img/filter5.png"]
         for f_img in filters:
             f_name = os.path.basename(f_img)
-            print(f"[{self.device_id}]   Clicking {f_name}...")
+            self.log(f"Clicking {f_name}...")
             if self.wait_and_click(f_img, timeout=15, threshold=0.95):
                 time.sleep(0.3)
             else:
-                print(f"[{self.device_id}]   WARNING: {f_name} not found, continuing anyway...")
+                self.log(f"WARNING: {f_name} not found, continuing anyway...")
         time.sleep(0.5)
 
-        print(f"[{self.device_id}] STEP 5: Scanning and dragging heroes...")
+        self.log(f"STEP 5: Scanning and dragging heroes...")
         filled_count = 0
         scroll_count = 0
         max_scroll = 20
         dragged_values = []
 
         while filled_count < 5 and scroll_count <= max_scroll:
-            print(f"[{self.device_id}]   Scanning region {REGION_SCAN}...")
+            self.log(f"Scanning region {REGION_SCAN}...")
             candidates = scanner.find_numbers_in_region(REGION_SCAN)
             under_target = [c for c in candidates if c["val"] < TARGET_VALUE and c["val"] >= 100 and c["conf"] >= 0.5]
 
             if under_target:
                 hero_info = [f"{c['val']}(conf:{c['conf']:.2f})" for c in under_target]
-                print(f"[{self.device_id}]   Found candidate(s): {hero_info}")
+                self.log(f"Found candidate(s): {hero_info}")
 
                 for hero in under_target:
                     if filled_count >= 5: break
 
                     if hero["val"] in dragged_values:
-                        print(f"[{self.device_id}]   Skipping hero {hero['val']} - Identical value already in team.")
+                        self.log(f"Skipping hero {hero['val']} - Identical value already in team.")
                         continue
 
                     target_slot = HERO_SLOTS[filled_count]
                     sx, sy = hero["pos"]
 
-                    print(f"[{self.device_id}]   Dragging hero {hero['val']} from ({sx}, {sy}) -> hero{filled_count+1} {target_slot}")
+                    self.log(f"Dragging hero {hero['val']} from ({sx}, {sy}) -> hero{filled_count+1} {target_slot}")
 
                     if target_slot in [(622, 248), (768, 251)]:
                         self.advanced_drag_hold([(sx, sy), REST_POINT, target_slot], hold_sec=3)
@@ -1449,51 +1617,51 @@ class BotInstance:
                     time.sleep(5)
                     dragged_values.append(hero["val"])
                     filled_count += 1
-                    print(f"[{self.device_id}]   Slots filled: {filled_count}/5 (Team Values: {dragged_values})")
+                    self.log(f"Slots filled: {filled_count}/5 (Team Values: {dragged_values})")
 
             if filled_count < 5:
                 scroll_count += 1
-                print(f"[{self.device_id}]   Scrolling to next candidate (attempt {scroll_count}/{max_scroll})...")
+                self.log(f"Scrolling to next candidate (attempt {scroll_count}/{max_scroll})...")
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe",
                                 "254", "442", "193", "447", "1000"], **self.kwargs)
                 time.sleep(3)
             else:
-                print(f"[{self.device_id}] Find team complete, stopping scan.")
+                self.log(f"Find team complete, stopping scan.")
                 break
 
         if filled_count >= 5:
-            print(f"[{self.device_id}] All 5 hero slots filled!")
+            self.log(f"All 5 hero slots filled!")
         else:
-            print(f"[{self.device_id}] Could only fill {filled_count}/5 slots after {scroll_count} scrolls.")
+            self.log(f"Could only fill {filled_count}/5 slots after {scroll_count} scrolls.")
 
-        print(f"[{self.device_id}] STEP 6: Saving team...")
+        self.log(f"STEP 6: Saving team...")
         time.sleep(1)
-        print(f"[{self.device_id}]   Clicking [backhero]...")
+        self.log(f"Clicking [backhero]...")
         self.wait_and_click("img/backhero.png", timeout=15, threshold=0.8)
         time.sleep(1)
-        print(f"[{self.device_id}]   Clicking [saveteam]...")
+        self.log(f"Clicking [saveteam]...")
         self.wait_and_click("img/saveteam.png", timeout=15, threshold=0.8)
         time.sleep(1)
-        print(f"[{self.device_id}] ==================================================")
-        print(f"[{self.device_id}]   FIND TEAM - COMPLETED!")
-        print(f"[{self.device_id}] ==================================================")
+        self.log(f"==================================================")
+        self.log(f"FIND TEAM - COMPLETED!")
+        self.log(f"==================================================")
 
     def run_step1(self):
         while True:
             fname = self._get_next_available_file()
             if not fname:
-                print(f"[{self.device_id}] No available accounts in queue. Waiting 10s...")
+                self.log(f"No available accounts in queue. Waiting 10s...")
                 time.sleep(10)
                 continue
                 
             self.current_account = fname
             self._checklv_done = False
-            print(f"[{self.device_id}] >>> PROCESSING NEW ACCOUNT: {fname} <<<")
+            self.log(f">>> PROCESSING NEW ACCOUNT: {fname} <<<")
             
             while True: # RETRY LOOP (Current Account)
                 try:
                     if self._need_restart:
-                        print(f"[{self.device_id}] RECOVERY: Need restart flag set. Restarting account flow...")
+                        self.log(f"RECOVERY: Need restart flag set. Restarting account flow...")
                         self._need_restart = False
                         # Ensure app is closed
                         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
@@ -1514,7 +1682,7 @@ class BotInstance:
                         self._need_restart = True
                         continue
                     if login_res == "failed" or login_res == False:
-                        print(f"[{self.device_id}] !! Login failed for {fname}. Moving to next.")
+                        self.log(f"!! Login failed for {fname}. Moving to next.")
                         self._release_file_lock(fname)
                         break
             
@@ -1558,14 +1726,14 @@ class BotInstance:
                         region     = stage_info["region"]
                         stage_num  = stage_info["num"]
 
-                        print(f"[{self.device_id}] === TARGET STAGE: {stage_num} (IMAGE) ===")
+                        self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
 
                         retry_find_stage = 0
                         while True:
                             self.capture_screen()
                             pos_q151 = self.find_image("img/stage151.png", threshold=0.95)
                             if pos_q151:
-                                print(f"[{self.device_id}] !!! STAGE 151 DETECTED !!! Triggering Routine...")
+                                self.log(f"!!! STAGE 151 DETECTED !!! Triggering Routine...")
                                 if not self.handle_quest_151():
                                     raise AccountFinished()
                                 continue
@@ -1573,19 +1741,19 @@ class BotInstance:
                             on_map = self.find_image("img/waitmainstage.png")
 
                             if not on_map:
-                                print(f"[{self.device_id}] Not on map. Checking for mainstage button...")
+                                self.log(f"Not on map. Checking for mainstage button...")
                                 pos_main = self.find_image("img/mainstage.png", threshold=0.7)
                                 if pos_main:
-                                    print(f"[{self.device_id}] Clicking mainstage button...")
+                                    self.log(f"Clicking mainstage button...")
                                     self.tap(pos_main[0], pos_main[1])
                                     self.wait_for_image("img/waitmainstage.png", timeout=15)
                                     time.sleep(2)
                                     self.capture_screen()
                                 else:
-                                    print(f"[{self.device_id}] Cannot find map marker or mainstage button. Retrying...")
+                                    self.log(f"Cannot find map marker or mainstage button. Retrying...")
                                     retry_find_stage += 1
                                     if retry_find_stage >= 10:
-                                        print(f"[{self.device_id}] RECOVERY: Stuck 10 times. Clicking backmainstage.png...")
+                                        self.log(f"RECOVERY: Stuck 10 times. Clicking backmainstage.png...")
                                         self.wait_and_click("img/backmainstage.png", timeout=5)
                                         retry_find_stage = 0
                                     time.sleep(2)
@@ -1593,7 +1761,7 @@ class BotInstance:
 
                             # Default 0.80 for all stages
                             search_threshold = 0.80
-                            print(f"[{self.device_id}] Searching for {target_img} in region with threshold {search_threshold}...")
+                            self.log(f"Searching for {target_img} in region with threshold {search_threshold}...")
                             pos = self.find_image_in_region(target_img, region, threshold=search_threshold)
 
                             if pos:
@@ -1612,13 +1780,13 @@ class BotInstance:
                                                 is_chest = True
                                                 break
                                 if is_chest:
-                                    print(f"[{self.device_id}] WARNING: Target matches chest1.png! Ignoring false positive.")
+                                    self.log(f"WARNING: Target matches chest1.png! Ignoring false positive.")
                                     time.sleep(1)
                                     continue
 
                             if pos:
                                 if stage_num == 31:
-                                    print(f"[{self.device_id}] Entering STAGE 31+ LOOP SYSTEM...")
+                                    self.log(f"Entering STAGE 31+ LOOP SYSTEM...")
                                     start_from_side = False
                                     
                                     while True:
@@ -1628,10 +1796,10 @@ class BotInstance:
                                                 raise AccountFinished()
                                             continue
 
-                                        print(f"[{self.device_id}] >>> Phase 1: Navigating (Dictionary Loop Mode)...")
+                                        self.log(f">>> Phase 1: Navigating (Dictionary Loop Mode)...")
                                         
                                         if start_from_side or self.is_first_31:
-                                            print(f"[{self.device_id}]   [Jump Recover] Checking nextstage -> nextnew before side...")
+                                            self.log(f"[Jump Recover] Checking nextstage -> nextnew before side...")
                                             self.process_sequence([
                                                 {"img": "img/nextstage.png", "loop": True, "timeout": 10},
                                                 {"img": "img/nextnew.png",   "loop": True, "timeout": 10}
@@ -1648,7 +1816,7 @@ class BotInstance:
                                         else:
                                             inner_nav_success = False
                                             while not inner_nav_success:
-                                                print(f"[{self.device_id}]   [Pre-Nav Loop] Checking clearstop -> nextstage -> nextnew...")
+                                                self.log(f"[Pre-Nav Loop] Checking clearstop -> nextstage -> nextnew...")
                                                 self.process_sequence([
                                                     {"img": "img/clearstop.png", "loop": True, "timeout": 10},
                                                     {"img": "img/nextstage.png", "loop": True, "timeout": 10},
@@ -1656,10 +1824,10 @@ class BotInstance:
                                                 ])
                                                 self.capture_screen()
                                                 if self.find_image("img/side.png", 0.8) or self.find_image("img/buyhelp.png", 0.8) or self.find_image("img/startnew.png", 0.8):
-                                                    print(f"[{self.device_id}]   Map context verified. Proceeding to main Navigation Sequence...")
+                                                    self.log(f"Map context verified. Proceeding to main Navigation Sequence...")
                                                     inner_nav_success = True
                                                     break
-                                                print(f"[{self.device_id}]   Not on Map yet! Looping back to clearstop -> nextstage -> nextnew (Timeout 10s)...")
+                                                self.log(f"Not on Map yet! Looping back to clearstop -> nextstage -> nextnew (Timeout 10s)...")
                                                 time.sleep(1)
 
                                         # Core Battle Transition Seq
@@ -1678,7 +1846,7 @@ class BotInstance:
                                             if res == "stop": raise AccountFinished()
                                             
                                             if self.is_first_31:
-                                                print(f"[{self.device_id}]   STAGE 31 SPECIAL AFTER CLEAR (som -> nextstage -> autoadvance1 -> 751,505x8)")
+                                                self.log(f"STAGE 31 SPECIAL AFTER CLEAR (som -> nextstage -> autoadvance1 -> 751,505x8)")
                                                 self.wait_and_click("img/som.png", timeout=15)
                                                 pos_ns = self.wait_and_click("img/nextstage.png", timeout=10)
                                                 if pos_ns: 
@@ -1690,7 +1858,7 @@ class BotInstance:
                                                 self.is_first_31 = False
 
                                             if res == "jump":
-                                                print(f"[{self.device_id}]   JUMP executed! Returning directly to Side...")
+                                                self.log(f"JUMP executed! Returning directly to Side...")
                                                 start_from_side = True
                                         
                                         time.sleep(1)
@@ -1699,42 +1867,42 @@ class BotInstance:
                                 else:
                                     # --- Standard Stage Handling (Non-31) ---
                                     if stage_num in [22, 23, 28]:
-                                        print(f"[{self.device_id}] Stage {stage_num}: Waiting 10s for screen scroll to settle...")
+                                        self.log(f"Stage {stage_num}: Waiting 10s for screen scroll to settle...")
                                         time.sleep(10)
-                                        print(f"[{self.device_id}] Stage {stage_num}: Re-detecting final position...")
+                                        self.log(f"Stage {stage_num}: Re-detecting final position...")
                                         pos_settled = self.find_image_in_region(target_img, region, threshold=search_threshold)
                                         if pos_settled:
                                             pos = pos_settled
                                         else:
-                                            print(f"[{self.device_id}] Stage {stage_num}: Lost target after settle! Retrying loop...")
+                                            self.log(f"Stage {stage_num}: Lost target after settle! Retrying loop...")
                                             continue
 
-                                    print(f"[{self.device_id}] Found stage {stage_num} image, tapping...")
+                                    self.log(f"Found stage {stage_num} image, tapping...")
 
                                     if stage_num == 5:
-                                        print(f"[{self.device_id}]   Stage 5: Checking for event version (eventstage5.png) in region...")
+                                        self.log(f"Stage 5: Checking for event version (eventstage5.png) in region...")
                                         pos_ev = self.find_image_in_region("img/eventstage5.png", region, threshold=0.8)
                                         if pos_ev:
-                                            print(f"[{self.device_id}]     Found event version for Stage 5 on map! Using that.")
+                                            self.log(f"Found event version for Stage 5 on map! Using that.")
                                             pos = pos_ev
 
                                     self.tap(pos[0], pos[1])
                                     time.sleep(1)
 
                                     if stage_num == 10:
-                                        print(f"[{self.device_id}] Stage 10 special: Checking for drag1...")
+                                        self.log(f"Stage 10 special: Checking for drag1...")
                                         time.sleep(1)
                                         pos_drag = self.find_image("img/drag1.png", threshold=0.8)
                                         if pos_drag:
-                                            print(f"[{self.device_id}]   Found drag1, performing dynamic drag to 258, 444...")
+                                            self.log(f"Found drag1, performing dynamic drag to 258, 444...")
                                             self.swipe(pos_drag[0], pos_drag[1], 258, 444, duration=1500)
                                             time.sleep(1)
 
                                     if stage_num == 13:
-                                        print(f"[{self.device_id}] Stage 13 special: Delay 2s then check checkstage1...")
+                                        self.log(f"Stage 13 special: Delay 2s then check checkstage1...")
                                         time.sleep(2)
                                         if self.wait_and_click("img/checkstage1.png", timeout=10):
-                                            print(f"[{self.device_id}]   Found checkstage1, clicking until gone...")
+                                            self.log(f"Found checkstage1, clicking until gone...")
                                             while True:
                                                 self.capture_screen()
                                                 p = self.find_image("img/checkstage1.png", 0.8)
@@ -1745,13 +1913,13 @@ class BotInstance:
                                                 break
 
                                     if stage_num == 25:
-                                        print(f"[{self.device_id}] Stage 25 special: Finding checkpoint2.png (timeout 5s)...")
+                                        self.log(f"Stage 25 special: Finding checkpoint2.png (timeout 5s)...")
                                         if self.wait_and_click("img/checkpoint2.png", timeout=5):
-                                            print(f"[{self.device_id}]   Found! Looping checkpoint2 until gone...")
+                                            self.log(f"Found! Looping checkpoint2 until gone...")
                                             while self.wait_and_click("img/checkpoint2.png", timeout=3): pass
 
                                     if stage_num == 30:
-                                        print(f"[{self.device_id}] Stage 30 special start sequence...")
+                                        self.log(f"Stage 30 special start sequence...")
                                         stage30_seq = [
                                             {"img": "img/next.png",    "loop": True,  "timeout": None},
                                             {"img": "img/skip.png",    "loop": False, "timeout": None},
@@ -1761,26 +1929,26 @@ class BotInstance:
                                             {"img": "img/push.png",    "loop": True,  "timeout": None}
                                         ]
                                         self.process_sequence(stage30_seq)
-                                        print(f"[{self.device_id}] Stage 30 logic completed, moving to battle.")
+                                        self.log(f"Stage 30 logic completed, moving to battle.")
                                         break
 
                                     if self.wait_and_click("img/start.png", timeout=5):
                                         if stage_num == 13:
-                                            print(f"[{self.device_id}] Stage 13 special post-start: Checking for auto1.png...")
+                                            self.log(f"Stage 13 special post-start: Checking for auto1.png...")
                                             pos_auto = self.wait_and_click("img/auto1.png", timeout=10, threshold=0.8)
                                             if pos_auto:
-                                                print(f"[{self.device_id}]   Found auto1! Clicking 2 times...")
+                                                self.log(f"Found auto1! Clicking 2 times...")
                                                 self.tap(pos_auto[0], pos_auto[1], label="auto1-rep1")
                                                 time.sleep(0.5)
                                                 self.tap(pos_auto[0], pos_auto[1], label="auto1-rep2")
                                         break
 
-                                print(f"[{self.device_id}] Stage {stage_num} image not found. (Retry: {retry_find_stage}/5)")
+                                self.log(f"Stage {stage_num} image not found. (Retry: {retry_find_stage}/5)")
 
                         hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
 
                         if stage_num == 13:
-                            print(f"[{self.device_id}]   Stage 13 Battle Logic: checking auto1 (wait 5s)...")
+                            self.log(f"Stage 13 Battle Logic: checking auto1 (wait 5s)...")
                             pos_auto = self.wait_and_click("img/auto1.png", timeout=5, threshold=0.8)
                             if pos_auto:
                                 self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-1")
@@ -1791,7 +1959,7 @@ class BotInstance:
                         stop_spam = False
 
                         def spam_heroes():
-                            print(f"[{self.device_id}]   [Machine-Gun] Tapping started!")
+                            self.log(f"[Machine-Gun] Tapping started!")
                             burst_coords = hero_coords * 2
                             tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst_coords]) + " & wait"
                             while not stop_spam:
@@ -1817,7 +1985,7 @@ class BotInstance:
 
                             self.capture_screen()
                             if self.find_image("img/win.png"):
-                                print(f"[{self.device_id}] WIN detected!")
+                                self.log(f"WIN detected!")
                                 stop_spam = True
                                 win_detected = True
                                 break
@@ -1825,18 +1993,924 @@ class BotInstance:
                         spam_thread.join()
                         self.handle_clear_routine(stage_num)
                 except GameCrashed:
-                    print(f"[{self.device_id}] RECOVERY: Game crashed. Retrying account {fname} from login...")
+                    self.log(f"RECOVERY: Game crashed. Retrying account {fname} from login...")
                     time.sleep(2)
                     continue # Re-runs push, login, find_team, then repeat loop for same account
                 except AccountFinished:
-                    print(f"[{self.device_id}] Account {self.current_account} reached Stage 151 and backed up. Switching...")
+                    self.log(f"Account {self.current_account} reached Stage 151 and backed up. Switching...")
                     # Success cleanup: Delete the injected file from backup folder
                     local_orig_path = os.path.join("backup", fname)
                     if os.path.exists(local_orig_path):
                         os.remove(local_orig_path)
-                        print(f"[{self.device_id}] Cleaned up backup file: {fname}")
+                        self.log(f"Cleaned up backup file: {fname}")
                     self._release_file_lock(fname)
                     break # Exits retry loop, moves to next account in global queue
+
+
+
+
+class SimpleUIStats:
+    def __init__(self):
+        self.total_files = 0
+        self.successful_logins = 0
+        self.failed_logins = 0
+        self.processed_files = 0
+        self.connected_devices = 0
+        self.lock = threading.RLock()
+        self.last_update = time.time()
+        self.update_interval = 30
+        self.device_statuses = {}
+        self.hero_counts = {}
+        # Counter สำหรับ hero found/not-found
+        self.success_count = 0 # Matches bot success_count
+        self.fail_count = 0    # Matches bot fail_count
+        self.random_fail_count = 0 # Counter for gacha/swap_shop failures
+        # hero found list with counts
+        self.hero_found_list = {}  # {hero_combo: count} e.g. {'Yor': 1, 'Yor+Anya': 2}
+        self.total_login_time = 0.0
+        self.login_time_count = 0
+        
+    def _get_shared_file(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared_stats.json")
+
+    def save_shared(self):
+        """Save stats to a shared file for multi-process sync (Atomic write)"""
+        try:
+            with self.lock:
+                data = {
+                    "success_count": self.success_count,
+                    "fail_count": self.fail_count,
+                    "random_fail_count": self.random_fail_count,
+                    "hero_found_list": self.hero_found_list,
+                    "device_statuses": self.device_statuses,
+                    "last_update": time.time(),
+                    "total_login_time": getattr(self, "total_login_time", 0),
+                    "login_time_count": getattr(self, "login_time_count", 0)
+                }
+                path = self._get_shared_file()
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                # Atomic replace with retry for Windows WinError 32
+                for _ in range(5):
+                    try:
+                        os.replace(tmp_path, path)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+                else:
+                    # Fallback
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+        except Exception as e:
+            print(f"[DEBUG] save_shared error: {e}")
+
+    def load_shared(self):
+        """Load stats from the shared file with retries"""
+        shared_file = self._get_shared_file()
+        if not os.path.exists(shared_file):
+            return
+            
+        for _ in range(5): # Retry up to 5 times
+            try:
+                with open(shared_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if not content: continue
+                    data = json.loads(content)
+                    with self.lock:
+                        # Only update if shared data is newer or to merge
+                        self.success_count = max(self.success_count, data.get("success_count", 0))
+                        self.fail_count = max(self.fail_count, data.get("fail_count", 0))
+                        self.random_fail_count = max(self.random_fail_count, data.get("random_fail_count", 0))
+                        
+                        # Merge hero lists (take max count)
+                        shared_heroes = data.get("hero_found_list", {})
+                        for h, count in shared_heroes.items():
+                            self.hero_found_list[h] = max(self.hero_found_list.get(h, 0), count)
+                            
+                        # Load login times
+                        self.total_login_time = data.get("total_login_time", self.total_login_time)
+                        self.login_time_count = data.get("login_time_count", self.login_time_count)
+                            
+                        # Update device statuses
+                        self.device_statuses.update(data.get("device_statuses", {}))
+                break
+            except Exception as e:
+                time.sleep(0.1)
+
+    def record_login_time(self, duration_sec):
+        self.load_shared()
+        with self.lock:
+            self.total_login_time += duration_sec
+            self.login_time_count += 1
+            self.save_shared()
+
+    def update(self, total=None, processed=None, success=None, fail=None, random_fail=None, devices=None, hero_found=None, hero_not_found=None):
+        self.load_shared() # Pull latest from others first to avoid overwriting counts
+        with self.lock:
+            if total is not None: self.total_files = total
+            if processed is not None: self.processed_files = processed
+            if success is not None: 
+                # For success/fail, we take the max of (local incremented) vs (shared latest)
+                # This is safer than just setting it.
+                self.success_count = max(self.success_count, success)
+            if fail is not None: 
+                self.fail_count = max(self.fail_count, fail)
+            if random_fail is not None:
+                self.random_fail_count = max(self.random_fail_count, random_fail)
+            if devices is not None: self.connected_devices = devices
+            if hero_found is not None: self.success_count += hero_found
+            if hero_not_found is not None: self.fail_count += hero_not_found
+            self.save_shared()
+    
+    def update_device(self, device_serial, status):
+        """Update device status and sync with shared file"""
+        self.load_shared() # Pull latest from others first
+        with self.lock:
+            self.device_statuses[device_serial] = status
+            self.save_shared() # Save merged state back
+    
+    def update_hero(self, hero_name, count=1):
+        """Update hero found count and sync"""
+        self.load_shared() # Pull latest first
+        with self.lock:
+            if hero_name not in self.hero_found_list:
+                self.hero_found_list[hero_name] = 0
+            self.hero_found_list[hero_name] += count
+            self.save_shared()
+
+    def get_hero_combo_stats(self):
+        self.load_shared() # Always refresh before getting
+        with self.lock:
+            return dict(self.hero_found_list)
+
+ui_stats = SimpleUIStats()
+GUI_INSTANCE = None
+
+if GUI_AVAILABLE:
+    class MainConfigWindow(ctk.CTkToplevel):
+        """Window to edit config.json settings"""
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.title("⚙️ ตั้งค่า Config")
+            self.geometry("550x650")
+            self.parent = parent
+            
+            self.transient(parent)
+            self.grab_set()
+            self.focus_force()
+            
+            self.cfg = self.load_config()
+            self.vars = {}
+            
+            scroll_frame = ctk.CTkScrollableFrame(self, width=500, height=500)
+            scroll_frame.pack(fill="both", expand=True, padx=20, pady=10)
+            
+            ctk.CTkLabel(scroll_frame, text="🎮 ฟีเจอร์เกม", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(10, 5), anchor="w")
+            
+            self.add_switch(scroll_frame, "Loop1 (เปิดเกมครั้งแรก)", "first_loop")
+            
+            # Black Screen Timeout - ใส่ตัวเลข
+            black_timeout_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            black_timeout_frame.pack(fill="x", padx=20, pady=5)
+            ctk.CTkLabel(black_timeout_frame, text="TimeOut จอดำ (วินาที):", anchor="w").pack(side="left")
+            self.black_timeout_entry = ctk.CTkEntry(black_timeout_frame, width=80)
+            self.black_timeout_entry.insert(0, str(self.cfg.get("black_screen_timeout", 8)))
+            self.black_timeout_entry.pack(side="left", padx=10)
+
+            self.add_switch(scroll_frame, "7-Day (รับของ 7 วัน)", "7day")
+            self.add_switch(scroll_frame, "แลกแต้มเขียว Leonard", "shopgacha")
+            self.add_switch(scroll_frame, "สุ่มตัว (Swap Shop)", "swap_shop")
+            self.add_switch(scroll_frame, "สุ่มตัว Event", "swap_shopevent")
+            self.add_switch(scroll_frame, "⚡ หลบไก่บี้ (kaibyskip)", "kaibyskip")
+            self.add_switch(scroll_frame, "⏩ ข้ามเช็คไก่บี้ (kaibycheck)", "kaibycheck")
+            self.add_switch(scroll_frame, "ใช้ตั๋วทั้งหมด", "all-tiket")
+            self.add_switch(scroll_frame, "ระบบ Link", "link")
+            self.add_switch(scroll_frame, "ใช้เพชรในการสุ่ม", "all-in")
+            
+            # Max Gacha - ใส่ตัวเลข
+            max_gacha_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            max_gacha_frame.pack(fill="x", padx=20, pady=5)
+            ctk.CTkLabel(max_gacha_frame, text="จำนวนสุ่มสูงสุด (0=ไม่จำกัด):", anchor="w").pack(side="left")
+            self.max_gacha_entry = ctk.CTkEntry(max_gacha_frame, width=80)
+            self.max_gacha_entry.insert(0, str(self.cfg.get("max-gacha", 0)))
+            self.max_gacha_entry.pack(side="left", padx=10)
+            
+            ctk.CTkFrame(scroll_frame, height=2, fg_color="gray30").pack(fill="x", pady=10)
+            ctk.CTkLabel(scroll_frame, text="⚙️ ตั้งค่า Gear", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(5, 5), anchor="w")
+            
+            self.add_switch(scroll_frame, "Ruby-Gear 200", "ruby-gear200")
+            self.add_switch(scroll_frame, "สุ่ม Gear", "random-gear")
+            self.add_switch(scroll_frame, "ตรวจสอบ Gear", "check-gear")
+            self.add_switch(scroll_frame, "ใช้ OCR (อ่านข้อความ)", "use_ocr")
+            
+            ctk.CTkFrame(scroll_frame, height=2, fg_color="gray30").pack(fill="x", pady=10)
+            ctk.CTkLabel(scroll_frame, text="📦 ตั้งค่ากล่อง", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(5, 5), anchor="w")
+            
+            box_settings = self.cfg.get("box_settings", {})
+            self.box_first_round = ctk.BooleanVar(value=bool(box_settings.get("first_round", 1)))
+            self.box_second_round = ctk.BooleanVar(value=bool(box_settings.get("second_round", 1)))
+            
+            ctk.CTkSwitch(scroll_frame, text="รอบแรก", variable=self.box_first_round).pack(pady=5, padx=20, anchor="w")
+            ctk.CTkSwitch(scroll_frame, text="รอบที่สอง", variable=self.box_second_round).pack(pady=5, padx=20, anchor="w")
+            
+            ctk.CTkFrame(scroll_frame, height=2, fg_color="gray30").pack(fill="x", pady=10)
+            ctk.CTkLabel(scroll_frame, text="📡 ตั้งค่าช่อง", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(5, 5), anchor="w")
+            
+            self.channel_var = ctk.StringVar(value=self.cfg.get("channel", "ch2"))
+            channel_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            channel_frame.pack(fill="x", padx=20, pady=5)
+            ctk.CTkLabel(channel_frame, text="เลือกช่อง:").pack(side="left")
+            channel_options = ["ch1", "ch2", "ch3", "ch4", "ch5"]
+            ctk.CTkOptionMenu(channel_frame, variable=self.channel_var, values=channel_options, width=100).pack(side="left", padx=10)
+            
+            self.add_switch(scroll_frame, "ใช้รูปช่อง", "channels_img")
+            
+            # =============================================
+            # ส่วนตั้งค่า Auto Trade
+            # =============================================
+            ctk.CTkFrame(scroll_frame, height=2, fg_color="gray30").pack(fill="x", pady=10)
+            ctk.CTkLabel(scroll_frame, text="🛒 Auto Trade (ซื้อของ Swap Shop)", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(5, 5), anchor="w")
+            
+            auto_trade_cfg = self.cfg.get("auto_trade", {})
+            self.auto_trade_enabled = ctk.BooleanVar(value=bool(auto_trade_cfg.get("enabled", 1)))
+            ctk.CTkSwitch(scroll_frame, text="เปิดใช้งาน Auto Trade", variable=self.auto_trade_enabled).pack(pady=5, padx=20, anchor="w")
+            
+            # Shop1 - เพชร
+            shop1_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            shop1_frame.pack(fill="x", padx=20, pady=3)
+            ctk.CTkLabel(shop1_frame, text="💎 เพชร (swap_shop1):", anchor="w", width=180).pack(side="left")
+            self.auto_trade_shop1 = ctk.CTkEntry(shop1_frame, width=60)
+            self.auto_trade_shop1.insert(0, str(auto_trade_cfg.get("swap_shop1", 1)))
+            self.auto_trade_shop1.pack(side="left", padx=5)
+            ctk.CTkLabel(shop1_frame, text="ครั้ง", anchor="w").pack(side="left")
+            
+            # Shop2 - ตั๋ว
+            shop2_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            shop2_frame.pack(fill="x", padx=20, pady=3)
+            ctk.CTkLabel(shop2_frame, text="🎟️ ตั๋ว (swap_shop2):", anchor="w", width=180).pack(side="left")
+            self.auto_trade_shop2 = ctk.CTkEntry(shop2_frame, width=60)
+            self.auto_trade_shop2.insert(0, str(auto_trade_cfg.get("swap_shop2", 1)))
+            self.auto_trade_shop2.pack(side="left", padx=5)
+            ctk.CTkLabel(shop2_frame, text="ครั้ง", anchor="w").pack(side="left")
+            
+            # Shopkom - กบฟ้า
+            shopkom_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            shopkom_frame.pack(fill="x", padx=20, pady=3)
+            ctk.CTkLabel(shopkom_frame, text="🐸 กบฟ้า (swap_shopkom):", anchor="w", width=180).pack(side="left")
+            self.auto_trade_shopkom = ctk.CTkEntry(shopkom_frame, width=60)
+            self.auto_trade_shopkom.insert(0, str(auto_trade_cfg.get("swap_shopkom", 1)))
+            self.auto_trade_shopkom.pack(side="left", padx=5)
+            ctk.CTkLabel(shopkom_frame, text="ครั้ง", anchor="w").pack(side="left")
+            
+            # Shopkom9star - กบ9ดาว
+            shopkom9_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+            shopkom9_frame.pack(fill="x", padx=20, pady=3)
+            ctk.CTkLabel(shopkom9_frame, text="⭐ กบ9ดาว (swap_shopkom9star):", anchor="w", width=180).pack(side="left")
+            self.auto_trade_shopkom9star = ctk.CTkEntry(shopkom9_frame, width=60)
+            self.auto_trade_shopkom9star.insert(0, str(auto_trade_cfg.get("swap_shopkom9star", 1)))
+            self.auto_trade_shopkom9star.pack(side="left", padx=5)
+            ctk.CTkLabel(shopkom9_frame, text="ครั้ง", anchor="w").pack(side="left")
+            
+            btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+            btn_frame.pack(fill="x", padx=20, pady=10)
+            
+            ctk.CTkButton(btn_frame, text="💾 บันทึก", command=self.save, fg_color="#2cc985", hover_color="#229f69", width=150).pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="❌ ยกเลิก", command=self.destroy, fg_color="#555555", hover_color="#444444", width=100).pack(side="right", padx=5)
+        
+        def load_config(self):
+            try:
+                if os.path.exists('configmain.json'):
+                    with open('configmain.json', 'r', encoding='utf-8') as f:
+                        return json.load(f)
+            except Exception as e:
+                print(f"Error loading config: {e}")
+            return {}
+        
+        def add_switch(self, parent, label, key):
+            val = self.cfg.get(key, 0)
+            var = ctk.BooleanVar(value=bool(val))
+            self.vars[key] = var
+            ctk.CTkSwitch(parent, text=label, variable=var).pack(pady=5, padx=20, anchor="w")
+            
+        def save(self):
+            try:
+                for key, var in self.vars.items():
+                    self.cfg[key] = 1 if var.get() else 0 # type: ignore
+                
+                if "box_settings" not in self.cfg:
+                    self.cfg["box_settings"] = {} # type: ignore
+                self.cfg["box_settings"]["first_round"] = 1 if self.box_first_round.get() else 0 # type: ignore
+                self.cfg["box_settings"]["second_round"] = 1 if self.box_second_round.get() else 0 # type: ignore
+                self.cfg["channel"] = self.channel_var.get() # type: ignore
+                
+                # Save max-gacha as number
+                try:
+                    self.cfg["max-gacha"] = int(self.max_gacha_entry.get()) # type: ignore
+                except:
+                    self.cfg["max-gacha"] = 0 # type: ignore
+                
+                # Save black_screen_timeout as number
+                try:
+                    self.cfg["black_screen_timeout"] = int(self.black_timeout_entry.get()) # type: ignore
+                except:
+                    self.cfg["black_screen_timeout"] = 8 # type: ignore
+                
+                # Save auto_trade settings
+                if "auto_trade" not in self.cfg:
+                    self.cfg["auto_trade"] = {} # type: ignore
+                self.cfg["auto_trade"]["enabled"] = 1 if self.auto_trade_enabled.get() else 0 # type: ignore
+                try:
+                    self.cfg["auto_trade"]["swap_shop1"] = int(self.auto_trade_shop1.get())
+                except:
+                    self.cfg["auto_trade"]["swap_shop1"] = 1
+                try:
+                    self.cfg["auto_trade"]["swap_shop2"] = int(self.auto_trade_shop2.get())
+                except:
+                    self.cfg["auto_trade"]["swap_shop2"] = 1
+                
+                with open('configmain.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.cfg, f, indent=4, ensure_ascii=False)
+                
+                self.parent.log("INFO", "✅ Config.json อัพเดทแล้ว")
+                self.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"บันทึกไม่สำเร็จ: {e}")
+
+
+    class HeroConfigWindow(ctk.CTkToplevel):
+        """
+        หน้าต่างตั้งค่าชื่อ Ranger และ Gear
+        HERO_MAPPING = ตั้งชื่อ Ranger ที่จะได้เมื่อพบรูป
+        เช่น gachahero1.png พบแล้วจะตั้งชื่อไฟล์เป็น "som+"
+        """
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.title("🦸 ตั้งชื่อ Ranger & Gear")
+            self.geometry("600x700")
+            self.parent = parent
+            
+            self.transient(parent)
+            self.grab_set()
+            self.focus_force()
+            
+            self.cfg = self.load_config()
+            
+            self.tabview = ctk.CTkTabview(self, width=550, height=550)
+            self.tabview.pack(fill="both", expand=True, padx=20, pady=10)
+            
+            self.tabview.add("🦸 Rangers")
+            self.tabview.add("⚙️ Gears")
+            self.tabview.add("🔫 Weapons")
+            
+            self.setup_hero_tab()
+            self.setup_gear_tab()
+            self.setup_weapon_tab()
+            
+            ctk.CTkButton(self, text="💾 บันทึกทั้งหมด", command=self.save_all, fg_color="#2cc985", hover_color="#229f69").pack(pady=10)
+        
+        def load_config(self):
+            try:
+                if os.path.exists('configmain.json'):
+                    with open('configmain.json', 'r', encoding='utf-8') as f:
+                        return json.load(f)
+            except Exception as e:
+                print(f"Error loading config: {e}")
+            return {}
+        
+        def setup_hero_tab(self):
+            tab = self.tabview.tab("🦸 Rangers")
+            
+            # คำอธิบาย
+            desc_frame = ctk.CTkFrame(tab, fg_color="#2b2b2b", corner_radius=8)
+            desc_frame.pack(fill="x", padx=10, pady=(10, 5))
+            ctk.CTkLabel(
+                desc_frame, 
+                text="📌 ตั้งชื่อ Ranger ที่จะบันทึก\\n📂 รูปอยู่ที่: img/ranger/gachaheroX.png\\n💡 เปลี่ยนรูปได้ง่าย แค่วางไฟล์ใหม่ทับ", 
+                font=ctk.CTkFont(size=11),
+                text_color="gray",
+                justify="left"
+            ).pack(padx=10, pady=5)
+            
+            ctk.CTkLabel(tab, text="รูป → ชื่อ Ranger", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+            
+            self.hero_entries = {}
+            hero_mapping = self.cfg.get("HERO_MAPPING", {})
+            
+            scroll = ctk.CTkScrollableFrame(tab, width=480, height=300)
+            scroll.pack(fill="both", expand=True, padx=10)
+            
+            for img, name in hero_mapping.items():
+                frame = ctk.CTkFrame(scroll, fg_color="transparent")
+                frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(frame, text=f"{img}.png:", width=130, anchor="e").pack(side="left")
+                entry = ctk.CTkEntry(frame, width=200)
+                entry.insert(0, name)
+                entry.pack(side="left", padx=5)
+                self.hero_entries[img] = entry
+        
+        def setup_gear_tab(self):
+            tab = self.tabview.tab("⚙️ Gears")
+            
+            desc_frame = ctk.CTkFrame(tab, fg_color="#2b2b2b", corner_radius=8)
+            desc_frame.pack(fill="x", padx=10, pady=(10, 5))
+            ctk.CTkLabel(
+                desc_frame, 
+                text="📌 ตั้งชื่อ Gear ที่จะบันทึก\\nเมื่อบอทพบรูป gearimgX.png จะตั้งชื่อไฟล์ตามที่กำหนด", 
+                font=ctk.CTkFont(size=11),
+                text_color="gray",
+                justify="left"
+            ).pack(padx=10, pady=5)
+            
+            ctk.CTkLabel(tab, text="รูป → ชื่อ Gear", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+            
+            self.gear_entries = {}
+            gear_mapping = self.cfg.get("gearname", {})
+            
+            scroll = ctk.CTkScrollableFrame(tab, width=480, height=300)
+            scroll.pack(fill="both", expand=True, padx=10)
+            
+            for img, name in gear_mapping.items():
+                frame = ctk.CTkFrame(scroll, fg_color="transparent")
+                frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(frame, text=f"{img}.png:", width=130, anchor="e").pack(side="left")
+                entry = ctk.CTkEntry(frame, width=200)
+                entry.insert(0, name)
+                entry.pack(side="left", padx=5)
+                self.gear_entries[img] = entry
+        
+        def setup_weapon_tab(self):
+            tab = self.tabview.tab("🔫 Weapons")
+            ctk.CTkLabel(tab, text="เปิด/ปิด Weapon ที่ต้องการตรวจสอบ", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
+            
+            self.weapon_vars = {}
+            weapon_mapping = self.cfg.get("weaponname", {})
+            
+            for img, enabled in weapon_mapping.items():
+                var = ctk.BooleanVar(value=enabled == "true" or enabled == True)
+                self.weapon_vars[img] = var
+                ctk.CTkSwitch(tab, text=img, variable=var).pack(pady=5, padx=20, anchor="w")
+        
+        def save_all(self):
+            try:
+                hero_mapping = {}
+                for img, entry in self.hero_entries.items():
+                    hero_mapping[img] = entry.get()
+                self.cfg["HERO_MAPPING"] = hero_mapping # type: ignore
+                
+                gear_mapping = {}
+                for img, entry in self.gear_entries.items():
+                    gear_mapping[img] = entry.get()
+                self.cfg["gearname"] = gear_mapping
+                
+                weapon_mapping = {}
+                for img, var in self.weapon_vars.items():
+                    weapon_mapping[img] = "true" if var.get() else "false"
+                self.cfg["weaponname"] = weapon_mapping
+                
+                with open('configmain.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.cfg, f, indent=4, ensure_ascii=False)
+                
+                messagebox.showinfo("สำเร็จ", "บันทึก Ranger & Gear เรียบร้อย!")
+                self.parent.log("INFO", "✅ Ranger & Gear อัพเดทแล้ว")
+                self.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"บันทึกไม่สำเร็จ: {e}")
+
+
+    class DeviceLogWindow(ctk.CTkToplevel):
+        def __init__(self, parent, device_id):
+            super().__init__(parent)
+            self.title(f"📑 Logs: {device_id}")
+            self.geometry("600x400")
+            self.device_id = device_id
+            
+            self.log_text = ctk.CTkTextbox(self, font=ctk.CTkFont(family="Consolas", size=11), text_color="#d1d5db")
+            self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
+            self.log_text.configure(state="disabled")
+            
+            # Load existing logs
+            if hasattr(parent, 'device_logs') and device_id in parent.device_logs:
+                self.update_logs(parent.device_logs[device_id])
+            
+            self.after(500, self.auto_refresh)
+
+        def update_logs(self, log_content):
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("end", log_content)
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+        def auto_refresh(self):
+            if not self.winfo_exists(): return
+            parent = self.master
+            if hasattr(parent, 'device_logs') and self.device_id in parent.device_logs:
+                current_text = self.log_text.get("1.0", "end-1c")
+                new_text = parent.device_logs[self.device_id]
+                if len(new_text) > (len(current_text) + 2): # Add 2 for potential newline diff
+                    self.update_logs(new_text)
+            self.after(1000, self.auto_refresh)
+
+    class DeviceMonitorWidget(ctk.CTkFrame):
+        def __init__(self, parent_gui, device_id, index):
+            super().__init__(parent_gui.dev_scroll, fg_color="#383838", corner_radius=6, height=36)
+            self.device_id = device_id
+            self.parent_gui = parent_gui
+            self.pack_propagate(False)
+            
+            chk = ctk.CTkCheckBox(self, text="", width=20, height=20, checkbox_width=16, checkbox_height=16)
+            chk.pack(side="left", padx=(6, 2))
+            chk.select()
+            
+            ctk.CTkLabel(self, text=f"#{index}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#ffffff", width=25).pack(side="left", padx=(0, 4))
+            
+            name_frame = ctk.CTkFrame(self, fg_color="transparent")
+            name_frame.pack(side="left", fill="y", padx=2)
+            
+            self.lbl_id = ctk.CTkLabel(name_frame, text=device_id, font=ctk.CTkFont(family="Consolas", size=10), text_color="#ccc", anchor="w")
+            self.lbl_id.pack(padx=0, pady=(2, 0))
+            
+            self.lbl_step = ctk.CTkLabel(name_frame, text="Ready", font=ctk.CTkFont(size=9), text_color="#888", anchor="w")
+            self.lbl_step.pack(padx=0, pady=(0, 2))
+            
+            # Action Buttons
+            btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+            btn_frame.pack(side="right", padx=4)
+            
+            ctk.CTkButton(btn_frame, text="Log", width=40, height=22, font=ctk.CTkFont(size=10, weight="bold"), 
+                         fg_color="#454545", hover_color="#555555", 
+                         command=lambda: self.parent_gui.open_device_log(self.device_id)).pack(side="right", padx=2)
+            
+            self.lbl_status = ctk.CTkLabel(btn_frame, text="READY", font=ctk.CTkFont(size=10, weight="bold"), text_color="#888", width=60)
+            self.lbl_status.pack(side="right", padx=6)
+
+        def update_state(self, status=None, step=None):
+            if status:
+                color_map = {'working': "#4caf50", 'waiting': "#ff9800", 'error': "#e53935", 'idle': "#888", 'success': "#2ecc71"}
+                self.lbl_status.configure(text=status.upper(), text_color=color_map.get(status.lower(), "#888"))
+            if step:
+                self.lbl_step.configure(text=step)
+
+
+    class ModernBotGUI(ctk.CTk):
+        def __init__(self, devices, args):
+            super().__init__()
+            global GUI_INSTANCE
+            GUI_INSTANCE = self
+            
+            self.title("loginสะสม")
+            self.geometry("720x550")
+            self.devices = devices
+            self.args = args
+            self.bot_threads = []
+            self.device_monitors = {}
+            self.device_logs = {} # Logs grouped by device_id
+            self.log_windows = {} # Currently open log windows
+            self.hero_stats_labels = {}
+
+            self.hero_rows = {}
+            self.hero_filter_text = ""
+            self.is_started = False
+            
+            self.setup_ui()
+            
+            # Handle window close
+            self.protocol("WM_DELETE_WINDOW", self.on_closing)
+            
+            # Use after to start the stats loop without blocking the constructor
+            self.after(100, self.update_realtime_stats)
+            
+            # Ensure window is visible
+            self.deiconify()
+            self.focus_force()
+            print("[GUI] Launched Successfully. Waiting for manual start.")
+            
+            if getattr(self.args, 'no_start', False):
+                print("[GUI] Monitor mode active (No internal threads).")
+                self.lbl_auto_start.configure(text="[ DASHBOARD MODE ]", text_color="#ffae42")
+            else:
+                self.lbl_auto_start.configure(text="[ WAITING FOR START ]", text_color="#aaaaaa")
+
+        def setup_ui(self):
+            # 1. TOP TOOLBAR
+            toolbar = ctk.CTkFrame(self, height=45, fg_color="#333333", corner_radius=0)
+            toolbar.pack(fill="x")
+            toolbar.pack_propagate(False)
+            
+            self.lbl_status = ctk.CTkLabel(toolbar, text=f"   ● ONLINE ({len(self.devices)})", font=ctk.CTkFont(size=12, weight="bold"), text_color="#4caf50")
+            self.lbl_status.pack(side="left", padx=5)
+
+            self.btn_start = ctk.CTkButton(toolbar, text="▶ START ALL", font=ctk.CTkFont(size=12, weight="bold"), width=100, height=28, fg_color="#e53935", hover_color="#c62828", command=self.start_bot)
+            self.btn_start.pack(side="left", padx=10)
+            
+            self.lbl_auto_start = ctk.CTkLabel(toolbar, text="[ READY ]", font=ctk.CTkFont(size=10, weight="bold"), text_color="#aaaaaa")
+            self.lbl_auto_start.pack(side="left", padx=5)
+            # Stats on Toolbar (right)
+            counter_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+            counter_frame.pack(side="right", padx=10)
+            
+            self.lbl_file_count = ctk.CTkLabel(counter_frame, text="📁 0", font=ctk.CTkFont(size=12, weight="bold"), text_color="#aaaaaa")
+            self.lbl_file_count.pack(side="left", padx=8)
+
+            self.lbl_succ_count = ctk.CTkLabel(counter_frame, text="✅ 0", font=ctk.CTkFont(size=12, weight="bold"), text_color="#4caf50")
+            self.lbl_succ_count.pack(side="left", padx=8)
+            
+            self.lbl_fail_count = ctk.CTkLabel(counter_frame, text="❌ 0", font=ctk.CTkFont(size=12, weight="bold"), text_color="#ff5555")
+            self.lbl_fail_count.pack(side="left", padx=8)
+
+            self.lbl_random_fail = ctk.CTkLabel(counter_frame, text="🎲 0", font=ctk.CTkFont(size=12, weight="bold"), text_color="#ffa500")
+            self.lbl_random_fail.pack(side="left", padx=8)
+            
+            self.lbl_avg_time = ctk.CTkLabel(toolbar, text="Avg: -", font=ctk.CTkFont(size=11), text_color="#2196f3")
+            self.lbl_avg_time.pack(side="right", padx=10)
+            
+            # 2. MAIN CONTENT
+            main_frame = ctk.CTkFrame(self, fg_color="transparent")
+            main_frame.pack(fill="both", expand=True, padx=6, pady=4)
+            main_frame.grid_columnconfigure(0, weight=4)
+            main_frame.grid_columnconfigure(1, weight=3)
+            main_frame.grid_rowconfigure(0, weight=1)
+            
+            # Left: Devices
+            left_frame = ctk.CTkFrame(main_frame, fg_color="#2b2b2b", corner_radius=8)
+            left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+            
+            dev_header = ctk.CTkFrame(left_frame, fg_color="#383838", corner_radius=0, height=28)
+            dev_header.pack(fill="x")
+            ctk.CTkLabel(dev_header, text="   DEVICES", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cccccc", anchor="w").pack(side="left")
+            
+            self.dev_scroll = ctk.CTkScrollableFrame(left_frame, fg_color="transparent")
+            self.dev_scroll.pack(fill="both", expand=True, padx=3, pady=3)
+            for i, dev in enumerate(self.devices):
+                m = DeviceMonitorWidget(self, dev, i+1)
+                m.pack(fill="x", pady=1)
+                self.device_monitors[dev] = m
+            
+            # Right: Heroes
+            right_frame = ctk.CTkFrame(main_frame, fg_color="#2b2b2b", corner_radius=8)
+            right_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
+            
+            hero_header = ctk.CTkFrame(right_frame, fg_color="#383838", corner_radius=0, height=56)
+            hero_header.pack(fill="x")
+            hero_header.pack_propagate(False)
+            
+            title_row = ctk.CTkFrame(hero_header, fg_color="transparent", height=28)
+            title_row.pack(fill="x")
+            ctk.CTkLabel(title_row, text="   🏆 HEROES FOUND", font=ctk.CTkFont(size=11, weight="bold"), text_color="#f2c94c", anchor="w").pack(side="left")
+            self.lbl_filter_count = ctk.CTkLabel(title_row, text="Filtered: 0", font=ctk.CTkFont(size=10), text_color="#aaaaaa")
+            self.lbl_filter_count.pack(side="right", padx=10)
+            
+            # Filter Entry
+            filter_frame = ctk.CTkFrame(hero_header, fg_color="transparent", height=24)
+            filter_frame.pack(fill="x", padx=5, pady=2)
+            self.ent_filter = ctk.CTkEntry(filter_frame, placeholder_text="🔍 Search heroes or gear (e.g. lapel)...", font=ctk.CTkFont(size=11), height=22, fg_color="#1e1e1e", border_width=1)
+            self.ent_filter.pack(fill="x", expand=True)
+            self.ent_filter.bind("<KeyRelease>", lambda e: self.on_filter_changed())
+            
+            self.hero_scroll = ctk.CTkScrollableFrame(right_frame, fg_color="transparent")
+            self.hero_scroll.pack(fill="both", expand=True, padx=3, pady=3)
+            
+            # 3. LOG AREA
+            log_frame = ctk.CTkFrame(self, fg_color="#1e1e1e", corner_radius=6, height=80)
+            log_frame.pack(fill="x", padx=6, pady=(0, 4))
+            log_frame.pack_propagate(False)
+            
+            self.log_text = ctk.CTkTextbox(log_frame, font=ctk.CTkFont(family="Consolas", size=10), text_color="#8b949e", fg_color="#1e1e1e")
+            self.log_text.pack(fill="both", expand=True, padx=2, pady=2)
+            self.log_text.configure(state="disabled")
+            
+            self.log("SYSTEM", "GUI started. Please press [START ALL] to begin.")
+
+        def open_device_log(self, device_id):
+            if device_id in self.log_windows and self.log_windows[device_id].winfo_exists():
+                self.log_windows[device_id].focus_force()
+            else:
+                self.log_windows[device_id] = self.DeviceLogWindow(self, device_id)
+                self.log_windows[device_id].focus_force()
+
+        def log_to_device(self, device_id, message):
+            ts = datetime.now().strftime("%H:%M:%S")
+            full_msg = f"[{ts}] {message}\n"
+            if device_id not in self.device_logs:
+                self.device_logs[device_id] = ""
+            self.device_logs[device_id] += full_msg
+            
+            # Keep only last 1000 lines
+            lines = self.device_logs[device_id].split('\n')
+            if len(lines) > 1000:
+                self.device_logs[device_id] = '\n'.join(lines[-1000:])
+            
+            # Mirror to global log if it's "CRITICAL"
+            if "⚠️" in message or "❌" in message or "Finished" in message:
+                self.log(device_id, message)
+            
+            # 4. BOTTOM BAR
+            bottom_bar = ctk.CTkFrame(self, height=32, fg_color="#333333", corner_radius=0)
+            bottom_bar.pack(fill="x")
+            
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            backup_folder = os.path.join(base_path, "backup")
+            heroes_folder = os.path.join(base_path, "backup-id")
+            
+            ctk.CTkButton(bottom_bar, text="🔌 Connect Missing", width=85, height=22, font=ctk.CTkFont(size=10), fg_color="#4caf50", command=self.connect_missing_devices).pack(side="left", padx=3, pady=4)
+            ctk.CTkButton(bottom_bar, text="⚙ Config", width=70, height=22, font=ctk.CTkFont(size=10), fg_color="#555555", command=self.open_config).pack(side="left", padx=3, pady=4)
+            ctk.CTkButton(bottom_bar, text="📁 Backup", width=70, height=22, font=ctk.CTkFont(size=10), fg_color="#555555", command=lambda: subprocess.Popen(f'explorer "{backup_folder}"')).pack(side="left", padx=3, pady=4)
+            ctk.CTkButton(bottom_bar, text="🦸 Heroes", width=70, height=22, font=ctk.CTkFont(size=10), fg_color="#555555", command=lambda: subprocess.Popen(f'explorer "{heroes_folder}"')).pack(side="left", padx=3, pady=4)
+            ctk.CTkLabel(bottom_bar, text="v3.2.0", font=ctk.CTkFont(size=10), text_color="#888888").pack(side="right", padx=8)
+
+        def connect_missing_devices(self):
+            """Scan for missing adb connections and start them dynamically"""
+            self.log("INFO", "Scanning for missing emulators...")
+            # Automatically perform port scan before checking devices
+            connect_known_ports()
+            
+            current_devices = get_connected_devices()
+            emulator_devices = [d for d in current_devices if d.startswith("emulator-") or d.startswith("127.0.0.1:")]
+            
+            new_count = 0
+            for dev in emulator_devices:
+                if dev not in self.devices:
+                    new_count += 1
+                    self.devices.append(dev)
+                    # Add to UI
+                    m = DeviceMonitorWidget(self.dev_scroll, dev, len(self.devices))
+                    m.pack(fill="x", pady=1)
+                    self.device_monitors[dev] = m
+                    
+                    # Start bot thread
+                    if getattr(self, 'is_started', False) and not getattr(self.args, 'no_start', False):
+                        bot = BotInstance(dev)
+                        t = threading.Thread(target=bot.run_step1)
+                        t.daemon = True
+                        t.start()
+                        self.bot_threads.append(t)
+                    self.log("SUCCESS", f"Connected new device: {dev}")
+            
+            if new_count > 0:
+                self.lbl_status.configure(text=f"   ● ONLINE ({len(self.devices)})")
+            else:
+                self.log("INFO", "No new devices found.")
+
+        def log(self, level, message): 
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", f"[{ts}] {message}\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+        def _start_single_bot(self, device_id):
+            bot = BotInstance(device_id)
+            t = threading.Thread(target=bot.run_step1)
+            t.daemon = True
+            t.start()
+            self.bot_threads.append(t)
+            self.log("INFO", f"🚀 Started bot on {device_id}")
+
+        def start_bot(self):
+            if getattr(self, 'is_started', False):
+                self.log("WARN", "Bot is already running.")
+                return
+            self.is_started = True
+            if hasattr(self, 'btn_start'):
+                self.btn_start.configure(state="disabled", fg_color="#555555", text="⏳ RUNNING")
+            self.lbl_auto_start.configure(text="[ BOT IS RUNNING ]", text_color="#4caf50")
+            
+            delay_sec = config.get("thread_delay", 5)
+            self.log("INFO", f"Starting Bot Threads (Delay: {delay_sec}s per device)...")
+            
+            for i, device_id in enumerate(self.devices):
+                delay_ms = i * int(delay_sec) * 1000
+                # Pass device_id explicitly by freezing the variable in the lambda
+                self.after(delay_ms, lambda d=device_id: self._start_single_bot(d))
+
+        def on_closing(self):
+            if messagebox.askokcancel("Quit", "คุณต้องการหยุดบอทและปิดโปรแกรมใช่หรือไม่?\n(จะทำการ Kill ADB และ Python ทั้งหมด)"):
+                print("[GUI] Shutting down... Killing background processes.")
+                try:
+                    # Kill ADB and Python processes on Windows
+                    if os.name == 'nt':
+                        subprocess.run("taskkill /F /IM adb.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        # We don't kill python.exe here because it would kill THIS process too early.
+                        # We use os._exit(0) at the end.
+                except:
+                    pass
+                self.destroy()
+                os._exit(0)
+
+        def update_realtime_stats(self):
+            try:
+                # Load shared stats from other processes
+                ui_stats.load_shared()
+                
+                with ui_stats.lock:
+                    # Count files real-time in the backup folder
+                    source_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backup")
+                    qsize = 0
+                    if os.path.exists(source_folder):
+                        qsize = len([f for f in os.listdir(source_folder) if f.lower().endswith(".xml")])
+                    
+                    self.lbl_file_count.configure(text=f"📁 {qsize}")
+                    self.lbl_succ_count.configure(text=f"✅ {ui_stats.success_count}")
+                    self.lbl_fail_count.configure(text=f"❌ {ui_stats.fail_count}")
+                    self.lbl_random_fail.configure(text=f"🎲 {ui_stats.random_fail_count}")
+                    
+                    for dev, stat in ui_stats.device_statuses.items():
+                        if dev in self.device_monitors:
+                            self.device_monitors[dev].update_state(status=stat.get('status'), step=stat.get('step'))
+                    
+                    hero_data: dict = dict(ui_stats.get_hero_combo_stats())
+                    
+                    # Handle Login Failures (fixid x 8)
+                    login_fail_count = ui_stats.fail_count
+                    if login_fail_count > 0:
+                        hero_data["❌ เข้าไม่ได้ (Login Failed)"] = login_fail_count
+                    
+                    # Handle Gacha Failures (swap_shop/gachaout)
+                    random_fail_count = ui_stats.random_fail_count
+                    # Also collect raw "สุ่มไม่ได้" from hero_found_list
+                    raw_random_fail = hero_data.pop("สุ่มไม่ได้", 0)
+                    total_gacha_fail = random_fail_count + raw_random_fail
+                    if total_gacha_fail > 0:
+                        hero_data["❌ สุ่มไม่ได้"] = total_gacha_fail
+                    
+                    # 2. Handle "Success but No Hero/Gear Found"
+                    # Merge various 'Success' or 'Not Found' keys into one positive label
+                    not_found_count = (hero_data.pop("ไม่เจอ", 0) + 
+                                       hero_data.pop("Not Found", 0) + 
+                                       hero_data.pop("Success", 0))
+                    
+                    if not_found_count > 0:
+                        hero_data["✅ สำเร็จ (Success)"] = not_found_count
+                    
+                    for hero, count in hero_data.items():
+                        if hero not in self.hero_stats_labels:
+                            # Color coding: Red for failures, Green for others
+                            # Only Login Failed, Cannot Gacha, and Kaiby are real errors
+                            is_error_row = "Login Failed" in hero or "สุ่มไม่ได้" in hero or "ไก่บี้" in hero
+                            self.add_hero_row(hero, is_error_row)
+                        
+                        self.hero_stats_labels[hero].configure(text=str(count))
+                    
+                    # Explicitly hide rows based on conditions
+                    to_hide = ["ไม่เจอ", "❌ ไม่เจอ"]
+                    for old_key in to_hide:
+                        if old_key in self.hero_rows:
+                            self.hero_rows[old_key].pack_forget()
+                    
+                    # Update Filter
+                    self.filter_heroes()
+                    
+                    # Update Avg Time
+                    if ui_stats.login_time_count > 0:
+                        avg_sec = ui_stats.total_login_time / ui_stats.login_time_count
+                        if avg_sec >= 60:
+                            self.lbl_avg_time.configure(text=f"Avg: {avg_sec/60:.1f}m")
+                        else:
+                            self.lbl_avg_time.configure(text=f"Avg: {avg_sec:.0f}s")
+            except Exception as e:
+                print(f"[GUI] Update error: {e}")
+            
+            self.after(2000, self.update_realtime_stats)
+
+        def on_filter_changed(self):
+            self.hero_filter_text = self.ent_filter.get().lower()
+            self.filter_heroes()
+
+        def filter_heroes(self):
+            total_filtered = 0
+            for hero, row in self.hero_rows.items():
+                if not self.hero_filter_text or self.hero_filter_text in hero.lower():
+                    row.pack(fill="x", pady=1)
+                    # Get count from label text
+                    try:
+                        count = int(self.hero_stats_labels[hero].cget("text"))
+                        total_filtered += count
+                    except: pass
+                else:
+                    row.pack_forget()
+            
+            if hasattr(self, 'lbl_filter_count'):
+                self.lbl_filter_count.configure(text=f"Filtered: {total_filtered}")
+
+
+        def add_hero_row(self, hero_name, is_not_found):
+            bg = "#3d2020" if is_not_found else "#2a3a2a"
+            txt_color = "#e53935" if is_not_found else "#4caf50"
+            row = ctk.CTkFrame(self.hero_scroll, fg_color=bg, corner_radius=6, height=26)
+            row.pack(fill="x", pady=1)
+            row.pack_propagate(False)
+            ctk.CTkLabel(row, text=f"  {hero_name}", font=ctk.CTkFont(size=11, weight="bold"), text_color="white", anchor="w").pack(side="left", fill="x", expand=True)
+            lbl_count = ctk.CTkLabel(row, text="0", font=ctk.CTkFont(size=12, weight="bold"), text_color=txt_color)
+            lbl_count.pack(side="right", padx=8)
+            self.hero_stats_labels[hero_name] = lbl_count
+            self.hero_rows[hero_name] = row
+
+        def open_config(self): MainConfigWindow(self)
+        def open_heroes(self): HeroConfigWindow(self)
+
+
 
 
 def main():
@@ -1849,7 +2923,6 @@ def main():
         print("No devices found.")
         return
 
-    # Startup Cleanup: Remove stale .lock files
     backup_dir = "backup"
     temp_lock_dir = os.path.join(tempfile.gettempdir(), "ranger-locks")
     if os.path.exists(backup_dir):
@@ -1861,14 +2934,29 @@ def main():
             try: os.remove(lf)
             except: pass
 
-    threads = []
-    for serial in serials:
-        bot = BotInstance(serial)
-        t = Thread(target=bot.run_step1)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
+    global ui_stats
+    ui_stats = SimpleUIStats()
+    
+    if GUI_AVAILABLE:
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("blue")
+        # Dummy args for GUI compatibility
+        class Args: pass
+        args = Args()
+        args.no_start = False
+        gui = ModernBotGUI(serials, args)
+        gui.mainloop()
+    else:
+        print("GUI NOT AVAILABLE! Running in standard mode.")
+        threads = []
+        for serial in serials:
+            bot = BotInstance(serial)
+            t = threading.Thread(target=bot.run_step1)
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
 if __name__ == "__main__":
     main()
