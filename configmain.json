@@ -1,0 +1,13 @@
+{
+    "getclearquest": 0,
+    "skip-lv": 1,
+    "kaibycheck": 0,
+    "kaibyskip": 1,
+    "do_7day": 0,
+    "find_ranger": 0,
+    "check-gear": 0,
+    "ruby-gear200": 0,
+    "random-gear": 0,
+    "thread_delay": 5,
+    "HERO_MAPPING": {}
+}

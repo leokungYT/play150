@@ -1,0 +1,58 @@
+{
+    "first_loop": true,
+    "thread_delay": 5,
+    "check-gear": 1,
+    "weaponname": {
+        "weaponimg1": "true",
+        "weaponimg2": "true",
+        "weaponimg3": "true"
+    },
+    "gearname": {
+        "gearimg1": {
+            "ocr": "Lapel",
+            "name": "lapel"
+        },
+        "gearimg2": {
+            "ocr": "Uniform",
+            "name": "uniform-anya"
+        },
+        "gearimg3": {
+            "ocr": "[spyjloid's hat",
+            "name": "loid-hat"
+        },
+        "gearimg4": {
+            "ocr": "[SPyJthorn P",
+            "name": "thorn-yor"
+        },
+        "gearimg5": {
+            "ocr": "Anya Hair",
+            "name": "anya-hair"
+        },
+        "gearimg6": {
+            "ocr": "Hairband",
+            "name": "hairband-yor8"
+        },
+        "gearimg7": {
+            "ocr": "Moonlit Dagger",
+            "name": "Moonlit-Dagger"
+        },
+        "gearimg8": {
+            "ocr": "Shining Axe",
+            "name": "Moonlit-Shining-Axe"
+        },
+        "gearimg9": {
+            "ocr": "Shining Shield",
+            "name": "Moonlit-Shining-Shield"
+        },
+        "gearimg10": {
+            "ocr": "Shining Belt",
+            "name": "MoonlitShining-Belt"
+        }
+    },
+    "ocr_region": {
+        "x": 463,
+        "y": 153,
+        "w": 397,
+        "h": 321
+    }
+}
