@@ -1272,7 +1272,13 @@ class BotInstance:
             wc("img/skipok.png", 15)
             
             # fixgear4-1 -> gearep3 -> repeat tap position 5 times
-            wc("img/fixgear4-1.png", 30)
+            pos_fg = wc("img/fixgear4-1.png", 30)
+            if pos_fg:
+                self.log(f"Repeating tap on fixgear4-1 x4...")
+                for _ in range(4):
+                    self.tap(pos_fg[0], pos_fg[1], label="fixgear4-1-repeat")
+                    time.sleep(0.5)
+            
             pos_g3 = wc("img/gearep3.png", 50)
             if pos_g3:
                 self.log(f"Repeating tap on gearep3 x9...")
@@ -1282,7 +1288,8 @@ class BotInstance:
             
             # gearep4 -> skip -> skip 10s -> backgearep1 -> mainstage
             wc("img/gearep4.png", 300)
-            wc("img/skip.png", 15)
+            wc("img/skip.png", 30)
+            wc("img/skipok.png",30)
             time.sleep(10)
             
             self.log(f"Stage 12: Tapping backgearep1.png until gone...")
