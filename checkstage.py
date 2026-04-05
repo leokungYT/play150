@@ -289,6 +289,7 @@ class BotInstance:
         self._in_popup_check = False
         self._checklv_done = False
         self._login_fixid_count = 0
+        self.login_done = False
 
 
     def log(self, message):
@@ -692,7 +693,9 @@ class BotInstance:
         if not getattr(self, "_in_popup_check", False):
             self._in_popup_check = True
             try:
-                self.check_floating_popups()
+                if not getattr(self, "login_done", False):
+                    self.check_floating_popups()
+                
                 # Independent Scan for Level Verify
                 if self.config.get("skip-lv", 0) == 1:
                     self.check_account_level()
@@ -1241,48 +1244,51 @@ class BotInstance:
             reward_sweep("Initial Sweep")
             
             # eventstage11 15s -> skip -> skipok -> gacha1
-            wc("img/eventstage11.png", 15)
-            wc("img/skip.png", 10)
-            wc("img/skipok.png", 5)
+            wc("img/eventstage11.png", 30)
+            wc("img/skip.png", 30)
+            wc("img/skipok.png", 15)
             
             # gacha1 -> gacha2 10s -> skip -> skipok
-            wc("img/gacha1.png", 5)
-            wc("img/gacha2.png", 10)
-            wc("img/skip.png", 10)
-            wc("img/skipok.png", 5)
+            wc("img/gacha1.png", 30)
+            wc("img/gacha2.png", 30)
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
             
             # gear1-gear5 -> skip -> skipok
             for g in range(1, 6):
-                wc(f"img/gear{g}.png", 5)
-            wc("img/skip.png", 10)
-            wc("img/skipok.png", 5)
+                wc(f"img/gear{g}.png", 15)
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
             
             # gearep1 -> skip -> 10s wait -> skipok
             wc("img/gearep1.png", 300)
-            wc("img/skip.png", 3)
+            wc("img/skip.png", 15)
             time.sleep(10)
-            wc("img/skipok.png", 5)
+            wc("img/skipok.png", 15)
             
             # gearep2 -> skip -> skipok
             wc("img/gearep2.png", 300)
-            wc("img/skip.png", 5)
-            wc("img/skipok.png", 5)
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
             
-            # gearep3 -> repeat tap position 5 times
-            pos_g3 = wc("img/gearep3.png", 10)
+            # fixgear4-1 -> gearep3 -> repeat tap position 5 times
+            wc("img/fixgear4-1.png", 30)
+            pos_g3 = wc("img/gearep3.png", 50)
             if pos_g3:
-                self.log(f"Repeating tap on gearep3 x5...")
-                for _ in range(5):
+                self.log(f"Repeating tap on gearep3 x9...")
+                for _ in range(9):
                     self.tap(pos_g3[0], pos_g3[1], label="gearep3-repeat")
                     time.sleep(0.5)
             
             # gearep4 -> skip -> skip 10s -> backgearep1 -> mainstage
             wc("img/gearep4.png", 300)
-            wc("img/skip.png", 10)
+            wc("img/skip.png", 15)
             time.sleep(10)
             
-            wc("img/backgearep1.png", 300)
-            wc("img/mainstage.png", 10)
+            self.log(f"Stage 12: Tapping backgearep1.png until gone...")
+            while wc("img/backgearep1.png", 5):
+                time.sleep(0.5)
+            wc("img/mainstage.png", 80)
             
             self.log(f"=== STAGE 12 SEQUENCE FINISHED ===")
             return True
@@ -1293,7 +1299,7 @@ class BotInstance:
         if stage_num == 13:
             self.log(f"=== STAGE 13 POST-WIN SEQUENCE ===")
             reward_sweep("Initial Sweep")
-            wc("img/mainstage.png", 10)
+            wc("img/mainstage.png", 50)
             self.log(f"Stage 13 Sequence Completed.")
             return True
 
@@ -1303,7 +1309,7 @@ class BotInstance:
         if stage_num == 14:
             self.log(f"=== STAGE 14 POST-WIN SEQUENCE ===")
             reward_sweep("Initial Sweep")
-            wc("img/skip.png", 15); wc("img/skipok.png", 15); wc("img/mainstage.png", 15)
+            wc("img/skip.png", 30); wc("img/skipok.png", 20); wc("img/mainstage.png", 20)
             reward_sweep("Default Final Cleanup", timeout_idle=5)
             self.log(f"Stage 14 Sequence Completed.")
             return True
@@ -1315,7 +1321,7 @@ class BotInstance:
             self.log(f"Stage 15: First Full Clearing...")
             reward_sweep("Initial Sweep")
             self.log(f"Stage 15: Starting Exact Sequential Logic...")
-            wc("img/skip.png", 15); wc("img/skip.png", 15); wc("img/skipok.png", 15)
+            wc("img/skip.png", 50); wc("img/skip.png", 50); wc("img/skipok.png", 50)
             # Loop egear1 -> 5 indefinitely until found, then tap until gone
             last_eg5_pos = None
             for img_name in ["egear1.png", "egear2.png", "egear3.png", "egear4.png", "egear5.png"]:
@@ -1785,6 +1791,7 @@ class BotInstance:
                 
             self.current_account = fname
             self._checklv_done = False
+            self.login_done = False # Reset for new account
             self.log(f">>> PROCESSING NEW ACCOUNT: {fname} <<<")
             
             while True: # RETRY LOOP (Current Account)
@@ -1814,6 +1821,9 @@ class BotInstance:
                         self.log(f"!! Login failed for {fname}. Moving to next.")
                         self._release_file_lock(fname)
                         break
+                    
+                    self.login_done = True # ✅ Login finished, stop popup checks
+                    self.log(f"Login complete for {fname}. Routine starting...")
             
                     # --- MAIN PLAY SEQUENCE ---
                     self.find_team()
@@ -2182,6 +2192,13 @@ class MainConfigWindow(ctk.CTkToplevel):
         ctk.CTkButton(btn_frame, text="💾 บันทึก", command=self.save, fg_color="#2cc985", hover_color="#229f69", width=120).pack(side="left", padx=5)
         ctk.CTkButton(btn_frame, text="❌ ยกเลิก", command=self.destroy, fg_color="#555555", hover_color="#444444", width=100).pack(side="right", padx=5)
     
+        ctk.CTkButton(
+            bottom_bar, text="📄 Open Logs", width=85, height=22,
+            font=ctk.CTkFont(size=10), fg_color="#1565c0",
+            command=lambda: subprocess.Popen(f'explorer "{self.log_dir}"')
+        ).pack(side="left", padx=3, pady=4)
+
+
     def load_config(self):
         try:
             if os.path.exists('configmain.json'):
@@ -2213,39 +2230,7 @@ class MainConfigWindow(ctk.CTkToplevel):
 
 
 
-class DeviceLogWindow(ctk.CTkToplevel):
-    def __init__(self, parent, device_id):
-        super().__init__(parent)
-        self.title(f"📑 Logs: {device_id}")
-        self.geometry("600x400")
-        self.device_id = device_id
-        
-        self.log_text = ctk.CTkTextbox(self, font=ctk.CTkFont(family="Consolas", size=11), text_color="#d1d5db")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
-        self.log_text.configure(state="disabled")
-        
-        # Load existing logs
-        if hasattr(parent, 'device_logs') and device_id in parent.device_logs:
-            self.update_logs(parent.device_logs[device_id])
-        
-        self.after(500, self.auto_refresh)
 
-    def update_logs(self, log_content):
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.insert("end", log_content)
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-
-    def auto_refresh(self):
-        if not self.winfo_exists(): return
-        parent = self.master
-        if hasattr(parent, 'device_logs') and self.device_id in parent.device_logs:
-            current_text = self.log_text.get("1.0", "end-1c")
-            new_text = parent.device_logs[self.device_id]
-            if len(new_text) > (len(current_text) + 2): # Add 2 for potential newline diff
-                self.update_logs(new_text)
-        self.after(1000, self.auto_refresh)
 
 class DeviceMonitorWidget(ctk.CTkFrame):
     def __init__(self, parent_gui, device_id, index):
@@ -2292,7 +2277,7 @@ class ModernBotGUI(ctk.CTk):
     # Class-level declarations for static analysis inference
     device_monitors = {}
     device_logs = {}
-    log_windows = {}
+
     hero_stats_labels = {}
     hero_rows = {}
     hero_filter_text = ""
@@ -2310,13 +2295,16 @@ class ModernBotGUI(ctk.CTk):
         self.bot_threads = []
         self.device_monitors = {}
         self.device_logs = {} # Logs grouped by device_id
-        self.log_windows = {} # Currently open log windows
+
         self.hero_stats_labels = {}
 
         self.hero_rows = {}
         self.hero_filter_text = ""
         self.is_started = False
-        
+        self.log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._system_log_path = os.path.join(self.log_dir, f"system_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+
         self.setup_ui()
         
         # Handle window close
@@ -2440,11 +2428,19 @@ class ModernBotGUI(ctk.CTk):
         ctk.CTkLabel(bottom_bar, text="v3.2.0", font=ctk.CTkFont(size=10), text_color="#888888").pack(side="right", padx=8)
 
     def open_device_log(self, device_id):
-        if device_id in self.log_windows and self.log_windows[device_id].winfo_exists():
-            self.log_windows[device_id].focus_force()
-        else:
-            self.log_windows[device_id] = DeviceLogWindow(self, device_id)
-            self.log_windows[device_id].focus_force()
+        # ✅ Open Notepad showing the actual log file
+        safe_id = device_id.replace(":", "_").replace(".", "_")
+        log_path = os.path.join(self.log_dir, f"device_{safe_id}.txt")
+        
+        # Ensure file exists so Notepad doesn't error out
+        if not os.path.exists(log_path):
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"--- Log started for {device_id} ---\n")
+        
+        try:
+            subprocess.Popen(["notepad.exe", log_path])
+        except Exception as e:
+            self.log("ERROR", f"Failed to open Notepad: {e}")
 
     def log_to_device(self, device_id, message):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2452,16 +2448,39 @@ class ModernBotGUI(ctk.CTk):
         if device_id not in self.device_logs:
             self.device_logs[device_id] = ""
         self.device_logs[device_id] += full_msg
-        
-        # Keep only last 1000 lines
-        lines: list[str] = self.device_logs[device_id].split('\n')
+
+        # ✅ Save to file
+        safe_id = device_id.replace(":", "_").replace(".", "_")
+        log_path = os.path.join(self.log_dir, f"device_{safe_id}.txt")
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(full_msg)
+        except Exception as e:
+            print(f"[LOG FILE ERROR] {e}")
+
+        # Keep only last 1000 lines in memory
+        lines = self.device_logs[device_id].split('\n')
         if len(lines) > 1000:
             self.device_logs[device_id] = '\n'.join(lines[-1000:])
-        
-        # Mirror to global log if it's "CRITICAL"
+
         if "⚠️" in message or "❌" in message or "Finished" in message:
             self.log(device_id, message)
-        
+
+    def log(self, level, message):
+        ts = datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{ts}] {message}\n"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", full_msg)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+        # ✅ Save to system log file
+        try:
+            with open(self._system_log_path, "a", encoding="utf-8") as f:
+                f.write(full_msg)
+        except Exception as e:
+            print(f"[SYSTEM LOG FILE ERROR] {e}")
+            
 
     def connect_missing_devices(self):
         """Scan for missing adb connections and start them dynamically"""
