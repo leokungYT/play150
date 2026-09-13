@@ -290,7 +290,59 @@ class BotInstance:
         self._checklv_done = False
         self._login_fixid_count = 0
         self.login_done = False
+        self._root_mode = None  # "su" | "adbd" | None (detected lazily)
 
+
+    def _ensure_root(self):
+        """Detect how to run root commands on this device.
+        Order: adbd already root -> su binary -> `adb root` (emulator / debuggable build).
+        Result cached in self._root_mode."""
+        if self._root_mode:
+            return self._root_mode
+
+        def shell_out(*args, timeout=10):
+            try:
+                r = subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", *args],
+                                   capture_output=True, text=True, timeout=timeout, **self.kwargs)
+                return (r.stdout or "").strip()
+            except Exception:
+                return ""
+
+        if shell_out("id", "-u") == "0":
+            self._root_mode = "adbd"
+        elif shell_out("su", "-c", "id -u") == "0":
+            self._root_mode = "su"
+        else:
+            self.log("No 'su' on device. Trying 'adb root'...")
+            try:
+                subprocess.run([self.adb_cmd, "-s", self.device_id, "root"],
+                               capture_output=True, text=True, timeout=15, **self.kwargs)
+            except Exception:
+                pass
+            for _ in range(10):
+                time.sleep(1)
+                if shell_out("id", "-u") == "0":
+                    self._root_mode = "adbd"
+                    break
+
+        if self._root_mode:
+            self.log(f"Root access OK (mode: {self._root_mode})")
+        else:
+            self.log("ERROR: No root access (no su and 'adb root' failed). Injection cannot work on this device!")
+        return self._root_mode
+
+    def root_shell(self, cmd, timeout=20):
+        """Run a shell command as root using whichever mode is available.
+        Returns CompletedProcess (stdout/stderr as text)."""
+        mode = self._ensure_root()
+        if mode == "su":
+            args = [self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", cmd]
+        else:
+            args = [self.adb_cmd, "-s", self.device_id, "shell", cmd]
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=timeout, **self.kwargs)
+        except Exception as e:
+            return subprocess.CompletedProcess(args, 1, "", str(e))
 
     def log(self, message):
         print(f"[{self.device_id}] {message}")
@@ -308,56 +360,73 @@ class BotInstance:
     def push_file(self, local_xml_path):
         remote_path = "/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml"
         self.log(f"Injecting file: {local_xml_path} (Robust Mode)...")
-        
+
+        if not os.path.exists(local_xml_path):
+            self.log(f"✗ Local file not found: {local_xml_path}")
+            return False
+
+        if not self._ensure_root():
+            self.log(f"✗ Injection FAILED: no root access on {self.device_id}")
+            return False
+
+        final_dir = "/data/data/com.linecorp.LGRGS/shared_prefs"
+        final = remote_path
+
         # Ensure directories exist
-        subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", "mkdir -p /data/data/com.linecorp.LGRGS/shared_prefs"], **self.kwargs)
-        
+        self.root_shell(f"mkdir -p {final_dir}")
+
         # Stop app first
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
         time.sleep(2)
-        
+
         # Kill for certainty
-        subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", "killall -9 com.linecorp.LGRGS 2>/dev/null || true"], **self.kwargs)
+        self.root_shell("killall -9 com.linecorp.LGRGS 2>/dev/null || true")
         time.sleep(1)
 
         src = os.path.abspath(local_xml_path)
         tmp = f"/data/local/tmp/temp_pref_{self.device_id.replace(':','_')}.xml"
-        final_dir = "/data/data/com.linecorp.LGRGS/shared_prefs"
-        final = remote_path
-        
+
+        import hashlib
+        with open(src, "rb") as f:
+            local_md5 = hashlib.md5(f.read()).hexdigest()
+
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                # Delete existing file first
-                subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", f"rm -f {final}"], **self.kwargs)
-                
-                # 1. Push to temp location
-                result = subprocess.run([self.adb_cmd, "-s", self.device_id, "push", src, tmp], capture_output=True, **self.kwargs)
+                # 1. Push to temp location (shell-writable)
+                result = subprocess.run([self.adb_cmd, "-s", self.device_id, "push", src, tmp],
+                                        capture_output=True, text=True, timeout=45, **self.kwargs)
                 if result.returncode != 0:
-                    self.log(f"Push attempt {attempt} failed.")
+                    self.log(f"Push attempt {attempt} failed: {(result.stderr or result.stdout).strip()}")
                     time.sleep(2)
                     continue
-                
-                # 2. Copy, set permissions and owner + SYNC
+
+                # 2. Copy into app dir as root, fix owner/perms/label
                 shell_cmd = (
-                    f"su -c '"
-                    f"rm -f {final}; " 
+                    f"rm -f {final}; "
                     f"cp {tmp} {final} && "
-                    f"chmod 666 {final} && "
-                    f"chown $(stat -c %u:%g {final_dir} 2>/dev/null || stat -c %u:%g {final_dir}/.. 2>/dev/null || echo 1000:1000) {final} || true && "
-                    f"rm -f {tmp} && "
-                    f"sync"
-                    f"'"
+                    f"chown $(stat -c %u:%g {final_dir}) {final}; "
+                    f"chmod 660 {final}; "
+                    f"restorecon {final} 2>/dev/null; "
+                    f"rm -f {tmp}; sync"
                 )
-                subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", shell_cmd], **self.kwargs)
-                
-                self.log(f"✓ Injection successful on attempt {attempt}")
-                return True
-                    
+                r = self.root_shell(shell_cmd)
+
+                # 3. Verify by checksum
+                v = self.root_shell(f"md5sum {final}")
+                remote_md5 = (v.stdout or "").strip().split(" ")[0] if v.stdout else ""
+                if remote_md5 == local_md5:
+                    self.log(f"✓ Injection successful on attempt {attempt} (md5 verified, mode: {self._root_mode})")
+                    return True
+
+                err = ((r.stdout or "") + (r.stderr or "") + (v.stdout or "") + (v.stderr or "")).strip()
+                self.log(f"Inject attempt {attempt}: verify failed (device md5={remote_md5 or 'none'}, local={local_md5}) {err[:200]}")
+                time.sleep(2)
+
             except Exception as e:
                 self.log(f"Attempt {attempt} error: {e}")
                 time.sleep(2)
-        
+
         self.log(f"✗ Injection FAILED after {max_retries} attempts!")
         return False
 
@@ -369,12 +438,10 @@ class BotInstance:
         
         try:
             # 1. Copy to temp with su (bypass shared_prefs permission)
-            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
-                           f"su -c 'cp {src_remote} {temp_remote}'"], **self.kwargs)
+            self.root_shell(f"cp {src_remote} {temp_remote}")
             
             # 2. Set permissions so adb pull can read it
-            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
-                           f"su -c 'chmod 666 {temp_remote}'"], **self.kwargs)
+            self.root_shell(f"chmod 666 {temp_remote}")
             
             # 3. Pull from temp location
             self.log(f"Pulling {src_remote} -> {local_path} (via {temp_remote})...")
@@ -387,15 +454,13 @@ class BotInstance:
                 self.log(f"✗ Pull failed: {result.stderr}")
             
             # 4. Clean up temp file
-            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
-                           f"su -c 'rm -f {temp_remote}'"], **self.kwargs)
+            self.root_shell(f"rm -f {temp_remote}")
                            
         except Exception as e:
             self.log(f"Pull file error: {e}")
             # Fallback: try direct pull with chmod
             try:
-                subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", 
-                               "su", "-c", f"chmod 666 {src_remote}"], **self.kwargs)
+                self.root_shell(f"chmod 666 {src_remote}")
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "pull", src_remote, local_path], **self.kwargs)
                 self.log(f"Fallback pull completed.")
             except Exception as e2:
@@ -696,9 +761,10 @@ class BotInstance:
                 if not getattr(self, "login_done", False):
                     self.check_floating_popups()
                 
-                # Independent Scan for Level Verify
-                if self.config.get("skip-lv", 0) == 1:
-                    self.check_account_level()
+                # Level verify is NOT done here anymore.
+                # It runs exactly once right after login: see verify_account_level_once().
+            except (AccountFinished, GameCrashed):
+                raise # Must propagate to run_step1 so the account is switched, not retried
             except Exception as e:
                 self.log(f"Popup check error: {e}")
             finally:
@@ -729,6 +795,13 @@ class BotInstance:
         self.log(f"Pressing BACK (ADB shell KEYCODE_BACK)")
         subprocess.run(
             [self.adb_cmd, "-s", self.device_id, "shell", "input", "keyevent", "KEYCODE_BACK"],
+            **self.kwargs
+        )
+
+    def press_esc(self):
+        self.log(f"Pressing ESC (ADB shell KEYCODE_ESCAPE)")
+        subprocess.run(
+            [self.adb_cmd, "-s", self.device_id, "shell", "input", "keyevent", "KEYCODE_ESCAPE"],
             **self.kwargs
         )
 
@@ -936,6 +1009,33 @@ class BotInstance:
             else:
                 self._raw_capture() # Update cache for next iteration
 
+    def verify_account_level_once(self, timeout=30):
+        """Run the account level gate EXACTLY ONCE, right after login (stoplogin found).
+        Waits for the level badge, reads it, then decides:
+          level <= 4  -> play normally (stage 1 .. 150)
+          level  > 4  -> move account to lv5+ and switch (raises AccountFinished)
+        Never checked again afterwards, because the level rises while playing.
+        """
+        if self.config.get("skip-lv", 0) != 1:
+            return
+
+        self._checklv_done = False
+        self.log(f"[CHECK-LV] Verifying account level once after login (timeout {timeout}s)...")
+
+        start = time.time()
+        while time.time() - start < timeout:
+            self.capture_screen()
+            self.check_account_level()  # raises AccountFinished if level > 4
+            if self._checklv_done:
+                break
+            time.sleep(1)
+
+        if not self._checklv_done:
+            self.log(f"[CHECK-LV] Level not confirmed within {timeout}s. Continuing normally.")
+
+        # Lock it down: no level check for the rest of this account's run
+        self._checklv_done = True
+
     def check_account_level(self):
         """Dedicated level verification with enhanced preprocessing for high accuracy"""
         skip_lv = self.config.get("skip-lv", 0)
@@ -1035,7 +1135,7 @@ class BotInstance:
         remote_path = "/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml"
         self.log(f"Backing up account to {dest_path}...")
         # Fix permissions before pulling
-        subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "su", "-c", f"chmod 666 {remote_path}"], **self.kwargs)
+        self.root_shell(f"chmod 666 {remote_path}")
         subprocess.run([self.adb_cmd, "-s", self.device_id, "pull", remote_path, dest_path], **self.kwargs)
         
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100:
@@ -1158,6 +1258,164 @@ class BotInstance:
         subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "draganddrop",
                         str(p2[0]), str(p2[1]), str(p3[0]), str(p3[1]), str(hold_sec*1000)], **self.kwargs)
 
+    def find_image_any(self, img_paths, threshold=0.8):
+        """Return (pos, matched_path) for the FIRST image found out of img_paths.
+        Used where the game has two art variants of the same button
+        (e.g. update1.png / update1new.png, drag1.png / drag1new.png)."""
+        for img in img_paths:
+            pos = self.find_image(img, threshold)
+            if pos:
+                return pos, img
+        return None, None
+
+    def run_update_flow(self, label="Update", timeout=60, finish_always=True):
+        """Hero level-up (update) flow:
+            update1 | update1new  -> tap
+            update2              -> tap
+            drag1  | drag1new    -> swipe hero (99,447) -> (395,259)
+            update3              -> tap x6 (2s apart)
+            skip -> skipok -> updateback -> mainstage
+        Returns True if the drag step was reached (flow actually ran), else False.
+        finish_always=False skips the closing skip/skipok/updateback/mainstage
+        when nothing showed up, so we do not waste time when there is no update screen."""
+        UPDATE1 = ["img/update1.png", "img/update1new.png"]
+        DRAG1   = ["img/drag1.png", "img/drag1new.png"]
+
+        upd_start = time.time(); upd_last_log = time.time(); found_drag = False
+        self.log(f"{label}: Looking for update1/update1new/update2/drag1/drag1new (timeout {timeout}s)...")
+
+        while time.time() - upd_start < timeout:
+            self.capture_screen()
+
+            pos_u1, hit_u1 = self.find_image_any(UPDATE1, 0.8)
+            if pos_u1:
+                self.tap(pos_u1[0], pos_u1[1], label=os.path.basename(hit_u1))
+                time.sleep(1); continue
+
+            u2 = self.find_image("img/update2.png", 0.8)
+            if u2:
+                self.tap(u2[0], u2[1], label="update2")
+                time.sleep(1); continue
+
+            pos_drag, hit_drag = self.find_image_any(DRAG1, 0.85)
+            if pos_drag:
+                self.log(f"Found {os.path.basename(hit_drag)} at {pos_drag}, Sweeping from 99, 447 to 395, 259 (800ms)...")
+                subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", "99", "447", "395", "259", "800"], **self.kwargs)
+                time.sleep(1); found_drag = True; break
+
+            if time.time() - upd_last_log > 5:
+                rem = int(timeout - (time.time() - upd_start))
+                self.log(f"...searching for update1/update1new/update2/drag1/drag1new ({rem}s remaining of {timeout}s)")
+                upd_last_log = time.time()
+            time.sleep(1)
+
+        if not found_drag:
+            self.log(f"{label}: update/drag1 not found within {timeout}s, skipping update flow...")
+            if not finish_always:
+                return False
+        else:
+            # Click update3 and repeat slowly (6 taps with 2s delay)
+            p_u3 = self.wait_and_click("img/update3.png", timeout=20)
+            if p_u3:
+                self.log(f"Clicking update3 repeats (Slower: 2s delay)...")
+                for _ in range(5):
+                    time.sleep(2.0)
+                    self.tap(p_u3[0], p_u3[1], label="update3-repeat")
+
+        # Finishing Flow (ensure we end up back on the map)
+        self.log(f"{label}: Executing finishing sequence...")
+        self.wait_and_click("img/skip.png", timeout=15)
+        self.wait_and_click("img/skipok.png", timeout=15)
+        self.wait_and_click("img/updateback.png", timeout=15)
+        self.wait_and_click("img/mainstage.png", timeout=15)
+        return found_drag
+
+    def run_7day_flow(self, label="7Day", timeout_first=15, timeout_rest=10):
+        """7-day reward flow, in order:
+            7day1 -> skip (10s) -> skipok (10s) -> 7day2 -> 7day3 -> 7day4
+        7day1 is the entry: if it never shows up within timeout_first there is no 7-day
+        popup on screen, so the rest is skipped instead of burning a timeout on each step."""
+        self.log(f"{label}: Looking for 7day1.png (timeout {timeout_first}s)...")
+        if not self.wait_and_click("img/7day1.png", timeout=timeout_first):
+            self.log(f"{label}: 7day1.png not found within {timeout_first}s, skipping 7day flow.")
+            return False
+
+        time.sleep(1)
+        self.log(f"{label}: 7day found. Clearing skip / skipok (10s each), then 7day2 -> 7day4...")
+        self.wait_and_click("img/skip.png", timeout=10)
+        self.wait_and_click("img/skipok.png", timeout=10)
+
+        for i in (2, 3, 4):
+            img = f"img/7day{i}.png"
+            if self.wait_and_click(img, timeout=timeout_rest):
+                time.sleep(1)
+            else:
+                self.log(f"{label}: 7day{i}.png not found within {timeout_rest}s, continuing...")
+        self.log(f"{label}: 7day sequence finished.")
+        return True
+
+    def run_stage6_detour(self, label="Stage 6 detour"):
+        """Stage 6 is not showing on the map. Clear what usually covers it, in this order:
+            quest (15s, then tapped repeatedly until quest1 appears) -> quest1 -> quest2 -> quest3
+            -> mainstage -> ESC once -> skip -> skipok
+            -> 7day1 (15s) -> rest of the 7day flow
+        Then the caller goes back to hunting num6."""
+        self.log(f"{label}: Stage 6 not found -> checking quest / 7day popups...")
+
+        pos_q = self.wait_and_click("img/quest.png", timeout=15)
+        if pos_q:
+            # Keep tapping quest.png. quest1.png showing up is the ONLY stop signal.
+            q_timeout = 60
+            q_start = time.time(); q_last_log = time.time(); q_taps = 1; saw_q1 = False
+            self.log(f"{label}: quest found. Tapping quest until quest1.png appears (timeout {q_timeout}s)...")
+
+            while time.time() - q_start < q_timeout:
+                self.capture_screen()
+
+                pos_q1 = self.find_image("img/quest1.png", 0.8)
+                if pos_q1:
+                    self.log(f"{label}: quest1.png appeared after {q_taps} quest tap(s). Stop tapping quest.")
+                    self.tap(pos_q1[0], pos_q1[1], label="quest1")
+                    saw_q1 = True
+                    time.sleep(1)
+                    break
+
+                pos_qq = self.find_image("img/quest.png", 0.8)
+                if pos_qq:
+                    pos_q = pos_qq
+                    self.tap(pos_qq[0], pos_qq[1], label="quest")
+                else:
+                    self.tap(pos_q[0], pos_q[1], label="quest-repeat")
+                q_taps += 1
+
+                if time.time() - q_last_log > 5:
+                    rem = int(q_timeout - (time.time() - q_start))
+                    self.log(f"...tapping quest, waiting for quest1.png ({rem}s remaining of {q_timeout}s)")
+                    q_last_log = time.time()
+                time.sleep(1)
+
+            if not saw_q1:
+                self.log(f"{label}: quest1.png never appeared within {q_timeout}s ({q_taps} taps). Continuing anyway...")
+
+            for q in (2, 3):
+                self.wait_and_click(f"img/quest{q}.png", timeout=15)
+                time.sleep(1)
+        else:
+            self.log(f"{label}: quest.png not found within 15s.")
+
+        self.log(f"{label}: Going to map (mainstage), then pressing ESC once...")
+        self.wait_and_click("img/mainstage.png", timeout=15)
+        time.sleep(2)
+        self.press_esc()
+        time.sleep(2)
+
+        self.log(f"{label}: Clearing skip / skipok before 7day...")
+        self.wait_and_click("img/skip.png", timeout=15)
+        self.wait_and_click("img/skipok.png", timeout=15)
+
+        self.run_7day_flow(label, timeout_first=15, timeout_rest=10)
+        return True
+
     def handle_clear_routine(self, stage_num):
         """Standardized Master Clear Routine (Deep Reward Edition)"""
         self.log(f"Starting clear sequence (Stage {stage_num})...")
@@ -1266,6 +1524,10 @@ class BotInstance:
             time.sleep(10)
             wc("img/skipok.png", 15)
             
+            # skip -> skipok before hunting gearep2 (a cutscene can sit in front of it)
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
+
             # gearep2 -> skip -> skipok
             wc("img/gearep2.png", 300)
             wc("img/skip.png", 15)
@@ -1377,36 +1639,13 @@ class BotInstance:
             
         reward_sweep("Initial Sweep")
 
-        if stage_num == 10:
-            self.log(f"Stage 10: Starting update and finishing flow...")
+        if stage_num == 11:
+            self.log(f"Stage 11: Starting update and finishing flow...")
             wc("img/skip.png", 15); wc("img/skipok.png", 15)
-            
-            while True:
-                self.capture_screen()
-                u1 = self.find_image("img/update1.png", 0.8); u2 = self.find_image("img/update2.png", 0.8)
-                if u1: self.tap(u1[0], u1[1], label="update1"); continue
-                if u2: self.tap(u2[0], u2[1], label="update2"); continue
-                pos_drag = self.find_image("img/drag1.png", threshold=0.85)
-                if pos_drag:
-                    self.log(f"Found drag1 at {pos_drag}, Sweeping from 99, 447 to 395, 259 (800ms)...")
-                    subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "input", "swipe", "99", "447", "395", "259", "800"], **self.kwargs)
-                    time.sleep(1); break
-                time.sleep(1)
-            
-            # Click update3 and repeat slowly (6 reps with 2s delay)
-            p_u3 = self.wait_and_click("img/update3.png", timeout=20)
-            if p_u3:
-                self.log(f"Clicking update3 repeats (Slower: 2s delay)...")
-                for _ in range(5): 
-                    time.sleep(2.0)
-                    self.tap(p_u3[0], p_u3[1], label="update3-repeat")
-            
-            # Finishing Flow (Ensuring it gets back to map for Stage 11)
-            self.log(f"Stage 10: Executing finishing sequence...")
-            wc("img/skip.png", 15); wc("img/skipok.png", 15)
-            wc("img/updateback.png", 15); wc("img/mainstage.png", 15)
-            
-            reward_sweep("Stage 10 Cleanup", timeout_idle=5)
+
+            self.run_update_flow("Stage 11", timeout=60, finish_always=True)
+
+            reward_sweep("Stage 11 Cleanup", timeout_idle=5)
             return True
 
         # ============================================================
@@ -1831,9 +2070,15 @@ class BotInstance:
                     
                     self.login_done = True # ✅ Login finished, stop popup checks
                     self.log(f"Login complete for {fname}. Routine starting...")
+
+                    # One-time account level gate (runs once here, never during play)
+                    self.verify_account_level_once(timeout=30)
             
                     # --- MAIN PLAY SEQUENCE ---
-                    self.find_team()
+                    if self.config.get("maketeam", 1) == 1:
+                        self.find_team()
+                    else:
+                        self.log(f"maketeam=0 -> Skipping find_team, going straight to stages.")
 
                     stage_sequence = [
                         {"num": 3,  "img": "img/stage/num3.png",       "region": (182, 244, 665, 180)},
@@ -1872,9 +2117,24 @@ class BotInstance:
                         region     = stage_info["region"]
                         stage_num  = stage_info["num"]
 
+                        # Stage 5 can leave a cutscene + the 7-day popup in front of the map
+                        if stage_num == 6:
+                            self.log(f"Before Stage 6: Clearing skip / skipok (2 rounds, 15s each), then 7day...")
+                            for r in (1, 2):
+                                self.log(f"Before Stage 6: skip / skipok round {r}/2...")
+                                self.wait_and_click("img/skip.png", timeout=15)
+                                self.wait_and_click("img/skipok.png", timeout=15)
+                            # Entry is 7day1.png (plain 7day.png is never tapped)
+                            self.run_7day_flow("Before Stage 6", timeout_first=15, timeout_rest=10)
+
+                        # Level-up (update) screen can appear after Stage 6 -> handle it before hunting Stage 7
+                        if stage_num == 7:
+                            self.run_update_flow("Before Stage 7", timeout=60, finish_always=False)
+
                         self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
 
                         retry_find_stage = 0
+                        stage_notfound_count = 0
                         while True:
                             self.capture_screen()
                             pos_q151 = self.find_image("img/stage151.png", threshold=0.95)
@@ -2082,7 +2342,14 @@ class BotInstance:
                                     if self.wait_and_click("img/start.png", timeout=5):
                                         break
 
-                                self.log(f"Stage {stage_num} image not found. (Retry: {retry_find_stage}/5)")
+                                stage_notfound_count += 1
+                                self.log(f"Stage {stage_num} image not found. (Retry: {stage_notfound_count}/5)")
+
+                                # Stage 6 hidden 5 times in a row -> quest / 7day popup is usually in the way
+                                if stage_num == 6 and stage_notfound_count >= 5:
+                                    self.log(f"Stage 6 not found 5 times -> Detour: quest -> BACK -> 7day -> mainstage...")
+                                    self.run_stage6_detour("Before Stage 6")
+                                    stage_notfound_count = 0
 
                         hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
 
@@ -2132,11 +2399,15 @@ class BotInstance:
                         spam_thread.join()
                         self.handle_clear_routine(stage_num)
                 except GameCrashed:
+                    if not os.path.exists(os.path.join("backup", fname)):
+                        self.log(f"RECOVERY: Account file {fname} no longer in backup/ (moved or removed). Switching to next account...")
+                        self._release_file_lock(fname)
+                        break
                     self.log(f"RECOVERY: Game crashed. Retrying account {fname} from login...")
                     time.sleep(2)
                     continue # Re-runs push, login, find_team, then repeat loop for same account
                 except AccountFinished:
-                    self.log(f"Account {self.current_account} reached Stage 151 and backed up. Switching...")
+                    self.log(f"Account {self.current_account} finished (Stage 151 backed up or moved to lv5+). Switching...")
                     # Success cleanup: Delete the injected file from backup folder
                     local_orig_path = os.path.join("backup", fname)
                     if os.path.exists(local_orig_path):
@@ -2193,6 +2464,12 @@ class MainConfigWindow(ctk.CTkToplevel):
         self.var_skip_lv = ctk.BooleanVar(value=bool(self.cfg.get("skip-lv", 0)))
         ctk.CTkSwitch(skip_lv_frame, text="เช็ค LV (ข้ามถ้า LV.5+)", variable=self.var_skip_lv).pack(side="left")
 
+        # Make Team
+        maketeam_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        maketeam_frame.pack(fill="x", padx=10, pady=5)
+        self.var_maketeam = ctk.BooleanVar(value=bool(self.cfg.get("maketeam", 1)))
+        ctk.CTkSwitch(maketeam_frame, text="จัดทีม (ปิด = ข้ามไปเล่นด่านเลย)", variable=self.var_maketeam).pack(side="left")
+
         
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=20, pady=10)
@@ -2219,6 +2496,7 @@ class MainConfigWindow(ctk.CTkToplevel):
         try:
             self.cfg["getclearquest"] = 1 if self.var_quest.get() else 0
             self.cfg["skip-lv"] = 1 if self.var_skip_lv.get() else 0
+            self.cfg["maketeam"] = 1 if self.var_maketeam.get() else 0
             
             try:
                 self.cfg["thread_delay"] = int(self.delay_entry.get())
