@@ -1160,43 +1160,75 @@ class BotInstance:
             self._checklv_done = True
             
             # 1. Capture & Crop Region
-            # Region: 25, 17, 81, 74
+            # Region: 25, 17, 81, 74 -- plus a padded version, in case the digits
+            # sit a few pixels outside it on some resolutions.
             region = (25, 17, 81, 74)
             rx, ry, rw, rh = region
-            img_crop = self.screen_bgr[ry:ry+rh, rx:rx+rw]
-            
-            # 2. Advanced Preprocessing for OCR Stability
-            # Convert to Grayscale
-            gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
-            # Upscale 3x (better for small digits)
-            resized = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-            # Denoise with slight blur
-            blurred = cv2.GaussianBlur(resized, (3, 3), 0)
-            # Thresholding to get sharp black/white text
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            
+            src_h, src_w = self.screen_bgr.shape[:2]
+            crops = []
+            for pad in (0, 12):
+                x0 = max(0, rx - pad); y0 = max(0, ry - pad)
+                x1 = min(src_w, rx + rw + pad); y1 = min(src_h, ry + rh + pad)
+                c = self.screen_bgr[y0:y1, x0:x1]
+                if c.size > 0:
+                    crops.append((pad, c))
+
+            # 2. Preprocessing variants. A single OTSU-inverted pass only works when the
+            # badge is light-on-dark; light backgrounds came out inverted and unreadable,
+            # which is what made this log "Could not read level reliably" over and over.
+            def _prep_variants(img_crop):
+                gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+                for scale in (3.0, 5.0):
+                    resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
+                    _, t_inv = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                    yield (f"otsu-inv@{scale:g}x", t_inv)
+                    _, t_bin = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    yield (f"otsu@{scale:g}x", t_bin)
+                    yield (f"adaptive@{scale:g}x", cv2.adaptiveThreshold(
+                        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 6))
+                    yield (f"gray@{scale:g}x", resized)
+
             import easyocr
             import re
             if self._ocr_reader is None:
                 self.log(f"[OCR] Initializing for Level Check...")
                 self._ocr_reader = easyocr.Reader(['en'], gpu=False)
-                
-            # Read text with digital allowlist
-            results = self._ocr_reader.readtext(thresh, allowlist='0123456789')
-            
+
+            # 3. Run the variants until one reads a plausible level confidently.
+            # The old single-variant path is tried first, so a clean badge costs
+            # exactly as much OCR as before; only failures pay for the extra passes.
             found_lv = None
-            max_conf = 0
-            for (bbox, text, conf) in results:
-                if conf > 0.3: # Higher confidence needed
-                    digits = re.findall(r'\d+', text)
-                    if digits:
+            max_conf = 0.0
+            best_tag = ""
+            for pad, crop in crops:
+                for tag, prepped in _prep_variants(crop):
+                    try:
+                        results = self._ocr_reader.readtext(prepped, allowlist='0123456789')
+                    except Exception as e:
+                        self.log(f"[CHECK-LV] OCR error on {tag}: {e}")
+                        continue
+                    for (bbox, text, conf) in results:
+                        digits = re.findall(r'\d+', text)
+                        if not digits:
+                            continue
                         val = int(digits[0])
-                        # Common sanity check: Level at checkpoint shouldn't be extreme
-                        if val > 99: continue 
-                        
+                        # Sanity: a checkpoint level is 1..99
+                        if not (1 <= val <= 99):
+                            continue
                         if conf > max_conf:
-                            found_lv = val
-                            max_conf = conf
+                            found_lv, max_conf, best_tag = val, conf, f"pad{pad}/{tag}"
+                    if max_conf >= 0.50:
+                        break
+                if max_conf >= 0.50:
+                    break
+
+            # Accept anything the allowlist read with some confidence. The old floor of
+            # 0.30 threw away readings that were right but slightly fuzzy.
+            if max_conf < 0.15:
+                found_lv = None
+            elif best_tag:
+                self.log(f"[CHECK-LV] Read via {best_tag}")
             
             if found_lv is not None:
                 self.log(f"[CHECK-LV] Detected Level: {found_lv} (Conf: {max_conf:.2f})")
