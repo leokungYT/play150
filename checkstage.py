@@ -185,8 +185,34 @@ class SimpleUIStats:
 ui_stats = SimpleUIStats()
 GUI_INSTANCE = None
 
+# Templates are re-read on every single match otherwise. Keyed by (path, mtime) so an
+# autoupdate that swaps img/ mid-run still picks the new file up.
+_TEMPLATE_CACHE = {}
+
+
+def load_template(template_path):
+    """cv2.imread with a cache. Returns None if the file is missing or unreadable."""
+    try:
+        mtime = os.path.getmtime(template_path)
+    except OSError:
+        return None
+    key = (template_path, mtime)
+    tpl = _TEMPLATE_CACHE.get(key)
+    if tpl is None:
+        tpl = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        if tpl is None:
+            return None
+        _TEMPLATE_CACHE[key] = tpl
+    return tpl
+
+
 # No tap / no progress for this long -> clear app, reopen, run the RE-LOOP recovery
 STALL_TIMEOUT_SEC = 18 * 60
+
+# Gap between machine-gun tap bursts. Each burst already sends a full chain of taps in
+# one adb call, so this paces process spawns, not tap rate. Lower = smoother in-game but
+# far heavier on the host.
+TAP_BURST_INTERVAL = 0.15
 
 
 class StallDetected(Exception):
@@ -680,36 +706,7 @@ class BotInstance:
                 continue
 
             # Handle event sequence if found (Precision 0.95)
-            if self.exists_in_cache("img/event.png", threshold=0.95):
-                pos_ev = self.find_image("img/event.png", threshold=0.95)
-                self.log(f"Found event.png, handling (Delay 2s)...")
-                self.tap(pos_ev[0], pos_ev[1])
-                time.sleep(2) 
-                
-                back_count: int = 0
-                while back_count < 10:
-                    self.capture_screen()
-                    
-                    # ถ้าเจอ cancel ให้กดแล้วหยุดกด back (break)
-                    if self.exists_in_cache("img/cancel.png"):
-                        self.log(f"Found cancel.png during event, clicking.")
-                        self.click("img/cancel.png")
-                        time.sleep(2)
-                        
-                        # ลองกด event.png อีกรอบเผื่อมีอันซ้อน
-                        self._raw_capture()
-                        if self.click("img/event.png", threshold=0.95):
-                            self.log(f"Detected another event.png after cancel, clicked.")
-                            time.sleep(2)
-                        
-                        break # ออกจากลูปกด back
-                        
-                    if self.find_image("img/stoplogin.png"): 
-                        break
-                        
-                    self.press_back()
-                    time.sleep(1.5)
-                    back_count += 1
+            self.handle_event_back()
             
             # Common popups
             for img in ["alert2.png", "fixid.png", "fixok.png", "fixid1.png", "fixokk.png"]:
@@ -829,8 +826,7 @@ class BotInstance:
 
     def find_image(self, template_path, threshold=0.8):
         if self.screen_bgr is None: return None
-        if not os.path.exists(template_path): return None
-        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        template = load_template(template_path)
         if template is None: return None
         res = cv2.matchTemplate(self.screen_bgr, template, cv2.TM_CCOEFF_NORMED)
         loc = np.where(res >= threshold)
@@ -841,10 +837,9 @@ class BotInstance:
 
     def find_image_in_region(self, template_path, region, threshold=0.8):
         if self.screen_bgr is None: return None
-        if not os.path.exists(template_path): return None
         rx, ry, rw, rh = region
         region_bgr = self.screen_bgr[ry:ry+rh, rx:rx+rw]
-        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        template = load_template(template_path)
         if template is None: return None
         res = cv2.matchTemplate(region_bgr, template, cv2.TM_CCOEFF_NORMED)
         loc = np.where(res >= threshold)
@@ -876,8 +871,7 @@ class BotInstance:
     def exists_in_cache(self, template_path, threshold=0.8):
         """Check if image exists in the current screen cache"""
         if self.screen_bgr is None: return False
-        if not os.path.exists(template_path): return False
-        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        template = load_template(template_path)
         if template is None: return False
         res = cv2.matchTemplate(self.screen_bgr, template, cv2.TM_CCOEFF_NORMED)
         loc = np.where(res >= threshold)
@@ -1027,6 +1021,45 @@ class BotInstance:
             else:
                 self._raw_capture() # Update cache for next iteration
 
+    def handle_event_back(self, max_back=10):
+        """event.png -> tap it, then press BACK over and over until cancel.png shows up
+        (click it, and clear a stacked event behind it) or stoplogin.png appears.
+        Expects a fresh capture in the cache. Returns True if an event was handled."""
+        if not self.exists_in_cache("img/event.png", threshold=0.95):
+            return False
+
+        pos_ev = self.find_image("img/event.png", threshold=0.95)
+        self.log(f"Found event.png, handling (Delay 2s)...")
+        self.tap(pos_ev[0], pos_ev[1])
+        time.sleep(2)
+
+        back_count = 0
+        while back_count < max_back:
+            self.capture_screen()
+
+            # ถ้าเจอ cancel ให้กดแล้วหยุดกด back (break)
+            if self.exists_in_cache("img/cancel.png"):
+                self.log(f"Found cancel.png during event, clicking.")
+                self.click("img/cancel.png")
+                time.sleep(2)
+
+                # ลองกด event.png อีกรอบเผื่อมีอันซ้อน
+                self._raw_capture()
+                if self.click("img/event.png", threshold=0.95):
+                    self.log(f"Detected another event.png after cancel, clicked.")
+                    time.sleep(2)
+
+                break # ออกจากลูปกด back
+
+            if self.find_image("img/stoplogin.png"):
+                break
+
+            self.press_back()
+            time.sleep(1.5)
+            back_count += 1
+
+        return True
+
     def _spam_until(self, stop_img, action="esc", label="spam", timeout=120, threshold=0.8):
         """Repeat `action` until stop_img shows up, then dismiss it and stop.
         action is either "esc" (ESC key) or an image path to tap."""
@@ -1063,6 +1096,12 @@ class BotInstance:
             self.open_app()
             time.sleep(5)
 
+            # Same event -> BACK spam as the login flow: an event popup right after the
+            # game starts would otherwise hide every recovery screen below.
+            self.capture_screen()
+            if self.handle_event_back():
+                self.log(f"RE-LOOP: cleared an event popup after start.")
+
             branches = [
                 ("check1",    "img/heyquest1/check1-reloop.bmp"),
                 ("check2",    "img/heyquest2/check2-reloop.bmp"),
@@ -1075,6 +1114,9 @@ class BotInstance:
             deadline = time.time() + wait_timeout
             while time.time() < deadline:
                 self.capture_screen()
+                # keep clearing event popups while we hunt for a recovery screen
+                if self.handle_event_back():
+                    self.capture_screen()
                 for name, path in branches:
                     if self.find_image(path, threshold=0.8):
                         found = name
@@ -1818,20 +1860,35 @@ class BotInstance:
         # ============================================================
         # DEFAULT WRAP-UP
         # ============================================================
-        # Loop skip -> skipok -> event -> mainstage until the next stage shows up.
-        # event.png can pop up at any point here and blocks mainstage, so it gets
-        # its own 8s window on every pass.
+        # Clear whatever cutscene sits in front of the map, but bail the moment the map
+        # itself is visible so the next stage starts right away. Polling one capture
+        # against all four images beats waiting out a 15s timeout per image: with the
+        # sequential waits a device that was already on the map still burned the full
+        # 180s before giving up.
         wrap_deadline = time.time() + 180
-        while True:
-            wc("img/skip.png", 15)
-            wc("img/skipok.png", 15)
-            if wc("img/event.png", 8):
-                self.log(f"Found event.png during wrap-up, cleared it.")
-            if wc("img/mainstage.png", 15):
+        wrap_targets = ["img/skip.png", "img/skipok.png", "img/event.png", "img/mainstage.png"]
+        while time.time() < wrap_deadline:
+            self.capture_screen()
+
+            # Map marker showing -> we are done, next stage can start now
+            if self.find_image("img/waitmainstage.png", 0.8):
+                self.log(f"Wrap-up: already on the map, moving to the next stage.")
                 break
-            if time.time() > wrap_deadline:
-                self.log(f"Wrap-up gave up waiting for mainstage.png after 180s.")
-                break
+
+            acted = False
+            for img in wrap_targets:
+                pos = self.find_image(img, 0.8)
+                if pos:
+                    self.tap(pos[0], pos[1], label=f"wrap-{os.path.basename(img)}")
+                    acted = True
+                    time.sleep(1.5)
+                    break
+
+            if not acted:
+                time.sleep(1)
+        else:
+            self.log(f"Wrap-up gave up waiting for the map after 180s.")
+
         reward_sweep("Default Final Cleanup", timeout_idle=5)
         return True
 
@@ -1984,7 +2041,10 @@ class BotInstance:
             tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst]) + " & wait"
             while not stop_spam:
                 subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", tap_chain], **self.kwargs)
-                time.sleep(0.01)
+                # One spawn per 10ms floods Windows with ~47 processes/sec per device.
+                # The chain already carries a full burst of taps, so pacing it costs
+                # almost no taps but far less CPU.
+                time.sleep(TAP_BURST_INTERVAL)
 
         spam_thread = Thread(target=spam_heroes_31)
         spam_thread.start()
@@ -2357,7 +2417,7 @@ class BotInstance:
                                     # Safety Check: Prevent falsely clicking chest1.png if it overlaps our target
                                     is_chest = False
                                     if self.screen_bgr is not None and os.path.exists("img/chest1.png"):
-                                        template_chest = cv2.imread("img/chest1.png", cv2.IMREAD_COLOR)
+                                        template_chest = load_template("img/chest1.png")
                                         if template_chest is not None:
                                             res_chest = cv2.matchTemplate(self.screen_bgr, template_chest, cv2.TM_CCOEFF_NORMED)
                                             loc_chest = np.where(res_chest >= 0.70)
@@ -2553,7 +2613,8 @@ class BotInstance:
                                 tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst_coords]) + " & wait"
                                 while not stop_spam:
                                     subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", tap_chain], **self.kwargs)
-                                    time.sleep(0.01)
+                                    # See TAP_BURST_INTERVAL: paces process spawns, not taps.
+                                    time.sleep(TAP_BURST_INTERVAL)
 
                             spam_thread = Thread(target=spam_heroes)
                             spam_thread.start()
