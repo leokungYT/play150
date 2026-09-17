@@ -1651,7 +1651,20 @@ class BotInstance:
         # ============================================================
         # DEFAULT WRAP-UP
         # ============================================================
-        wc("img/skip.png", 15); wc("img/skipok.png", 15); wc("img/mainstage.png", 15)
+        # Loop skip -> skipok -> event -> mainstage until the next stage shows up.
+        # event.png can pop up at any point here and blocks mainstage, so it gets
+        # its own 8s window on every pass.
+        wrap_deadline = time.time() + 180
+        while True:
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
+            if wc("img/event.png", 8):
+                self.log(f"Found event.png during wrap-up, cleared it.")
+            if wc("img/mainstage.png", 15):
+                break
+            if time.time() > wrap_deadline:
+                self.log(f"Wrap-up gave up waiting for mainstage.png after 180s.")
+                break
         reward_sweep("Default Final Cleanup", timeout_idle=5)
         return True
 
