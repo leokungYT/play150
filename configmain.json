@@ -1,7 +1,7 @@
 {
     "getclearquest": 0,
     "skip-lv": 1,
-    "maketeam": 0,
+    "maketeam": 1,
     "kaibycheck": 0,
     "kaibyskip": 1,
     "do_7day": 0,
