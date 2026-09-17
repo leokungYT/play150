@@ -1860,34 +1860,18 @@ class BotInstance:
         # ============================================================
         # DEFAULT WRAP-UP
         # ============================================================
-        # Clear whatever cutscene sits in front of the map, but bail the moment the map
-        # itself is visible so the next stage starts right away. Polling one capture
-        # against all four images beats waiting out a 15s timeout per image: with the
-        # sequential waits a device that was already on the map still burned the full
-        # 180s before giving up.
-        wrap_deadline = time.time() + 180
-        wrap_targets = ["img/skip.png", "img/skipok.png", "img/event.png", "img/mainstage.png"]
-        while time.time() < wrap_deadline:
-            self.capture_screen()
-
-            # Map marker showing -> we are done, next stage can start now
-            if self.find_image("img/waitmainstage.png", 0.8):
-                self.log(f"Wrap-up: already on the map, moving to the next stage.")
-                break
-
-            acted = False
-            for img in wrap_targets:
-                pos = self.find_image(img, 0.8)
-                if pos:
-                    self.tap(pos[0], pos[1], label=f"wrap-{os.path.basename(img)}")
-                    acted = True
-                    time.sleep(1.5)
-                    break
-
-            if not acted:
-                time.sleep(1)
+        # Original sequential wrap-up: one pass, no retry loop. Slow but it never hangs.
+        # The only change is the map check up front -- if the next stage is already
+        # reachable there is nothing to skip, so don't sit through the waits.
+        self.capture_screen()
+        if self.find_image("img/waitmainstage.png", 0.8):
+            self.log(f"Wrap-up: already on the map, moving to the next stage.")
         else:
-            self.log(f"Wrap-up gave up waiting for the map after 180s.")
+            wc("img/skip.png", 15)
+            wc("img/skipok.png", 15)
+            if wc("img/event.png", 8):
+                self.log(f"Found event.png during wrap-up, cleared it.")
+            wc("img/mainstage.png", 15)
 
         reward_sweep("Default Final Cleanup", timeout_idle=5)
         return True
