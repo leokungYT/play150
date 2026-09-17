@@ -806,6 +806,60 @@ def handle_apple_sequence(device):
 
 
 
+def tap_image(device, adb_img, img_name, threshold=0.95):
+    """Find img_name on the given screenshot and tap it. Returns True if tapped."""
+    pos = ImgSearchADB(adb_img, f'img/{img_name}', threshold=threshold)
+    if pos:
+        device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+        return True
+    return False
+
+
+def check_fixnet(device, adb_img):
+    """เช็ค popup ตระกูล fixnet ทุก loop ถ้าเจอให้กดทันที (ล้อตาม checkstage.py).
+
+    Returns True ถ้าจัดการ popup ไปตัวหนึ่ง
+    """
+    if adb_img is None:
+        return False
+
+    # fixnetv2.png: Network/Retry Sequence
+    if ImgSearchADB(adb_img, 'img/fixnetv2.png'):
+        tap_image(device, adb_img, 'cancel.png')
+        if tap_image(device, adb_img, 'fixnetv2.png'):
+            time.sleep(3)
+            shot = get_screen_capture(device)
+            if shot is not None:
+                tap_image(device, shot, 'fixnetv2ok.png')
+            time.sleep(2)
+        return True
+
+    # fixnet.png: General Connection Error -> กด oknet
+    if ImgSearchADB(adb_img, 'img/fixnet.png'):
+        if tap_image(device, adb_img, 'cancel.png'):
+            time.sleep(1)
+            adb_img = get_screen_capture(device)
+            if adb_img is None:
+                return True
+        tap_image(device, adb_img, 'oknet.png')
+        time.sleep(2)
+        return True
+
+    # fixnet1.png: Secondary Connection Error -> กดตำแหน่งคงที่
+    if ImgSearchADB(adb_img, 'img/fixnet1.png'):
+        device.shell("input tap 476 394")
+        time.sleep(2)
+        return True
+
+    # fixnetv3.png: Force Restart popup
+    if ImgSearchADB(adb_img, 'img/fixnetv3.png'):
+        tap_image(device, adb_img, 'fixnetv3.png')
+        time.sleep(2)
+        return True
+
+    return False
+
+
 def main_login(device):
     stoplogin_count = 0
     fixbug_timer = None
@@ -858,6 +912,13 @@ def main_login(device):
                 continue
 
             found_any_image = False
+
+            # ⭐ เช็ค fixnet ทุก loop ก่อนอย่างอื่น เจอเมื่อไหร่กดทันที
+            if check_fixnet(device, adb_img):
+                consecutive_no_image = 0
+                no_image_timer = None
+                last_found_time = 0
+                continue
 
             if check_black_screen(adb_img, threshold=0.8):
                 if black_screen_timer is None:
@@ -1077,7 +1138,6 @@ def main_login(device):
             secondary_images = [
                 ('check.png', 'check'),
                 ('okwhite.png', 'okwhite'),
-                ('fixnet.png', 'fixnet'),
                 ('fixplay.png', 'fixplay'),
                 ('oknet.png', 'oknet'),
                 ('fixalerterror1.png','fixalerterror1'),

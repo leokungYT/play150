@@ -185,6 +185,15 @@ class SimpleUIStats:
 ui_stats = SimpleUIStats()
 GUI_INSTANCE = None
 
+# No tap / no progress for this long -> clear app, reopen, run the RE-LOOP recovery
+STALL_TIMEOUT_SEC = 18 * 60
+
+
+class StallDetected(Exception):
+    """Raised when nothing has made progress for STALL_TIMEOUT_SEC."""
+    pass
+
+
 class AccountFinished(Exception):
     """Raised when an account reached Stage 151 and needs backup/switching."""
     pass
@@ -288,6 +297,7 @@ class BotInstance:
         self._need_restart = False
         self._in_popup_check = False
         self._checklv_done = False
+        self._in_reloop = False
         self._login_fixid_count = 0
         self.login_done = False
         self._root_mode = None  # "su" | "adbd" | None (detected lazily)
@@ -740,6 +750,13 @@ class BotInstance:
         return False
 
     def capture_screen(self):
+        # Stall watchdog: nothing tapped for STALL_TIMEOUT_SEC -> hand over to RE-LOOP.
+        # Skipped while a recovery is already running, otherwise it would re-trigger itself.
+        if not self._in_reloop and time.time() - self.last_activity_time > STALL_TIMEOUT_SEC:
+            mins = int((time.time() - self.last_activity_time) / 60)
+            self.log(f"!!! STALL: no progress for {mins} min (limit {STALL_TIMEOUT_SEC // 60}) !!!")
+            raise StallDetected()
+
         # Regularly check if game process is alive
         self.check_pid_timer += 1
         if self.check_pid_timer >= 5:
@@ -785,6 +802,7 @@ class BotInstance:
         return False
 
     def tap(self, x, y, label=None):
+        self.last_activity_time = time.time()
         if label:
             self.log(f"Tapping {label} at ({x}, {y})")
         else:
@@ -1008,6 +1026,101 @@ class BotInstance:
                 break
             else:
                 self._raw_capture() # Update cache for next iteration
+
+    def _spam_until(self, stop_img, action="esc", label="spam", timeout=120, threshold=0.8):
+        """Repeat `action` until stop_img shows up, then dismiss it and stop.
+        action is either "esc" (ESC key) or an image path to tap."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.capture_screen()
+            if self.find_image(stop_img, threshold=threshold):
+                self.log(f"{label}: {os.path.basename(stop_img)} appeared -> stopping.")
+                self.click(stop_img, threshold=threshold)
+                time.sleep(1)
+                return True
+            if action == "esc":
+                self.press_esc()
+            else:
+                self.click(action, threshold=threshold)
+            time.sleep(0.5)
+        self.log(f"{label}: gave up after {timeout}s without seeing {os.path.basename(stop_img)}.")
+        return False
+
+    def handle_reloop(self, wait_timeout=120):
+        """RE-LOOP recovery after a stall: clear the app, reopen the game, then take
+        whichever of the five known recovery screens is showing and get back on track.
+
+        Returns "gacha" or "egear" when the caller must restart that sub-sequence,
+        otherwise "resume" (back on the map -> carry on with the current step).
+        """
+        if self._in_reloop:
+            return "resume"
+        self._in_reloop = True
+        try:
+            self.log(f"=== RE-LOOP: clearing app and reopening the game ===")
+            subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", "am", "force-stop", "com.linecorp.LGRGS"], **self.kwargs)
+            time.sleep(3)
+            self.open_app()
+            time.sleep(5)
+
+            branches = [
+                ("check1",    "img/heyquest1/check1-reloop.bmp"),
+                ("check2",    "img/heyquest2/check2-reloop.bmp"),
+                ("heygacha",  "img/heygacha/heygacha.bmp"),
+                ("heygacha2", "img/heygacha2/heygacha2.bmp"),
+                ("heybrown",  "img/heybrown/heybrown.bmp"),
+            ]
+
+            found = None
+            deadline = time.time() + wait_timeout
+            while time.time() < deadline:
+                self.capture_screen()
+                for name, path in branches:
+                    if self.find_image(path, threshold=0.8):
+                        found = name
+                        break
+                if found:
+                    break
+                rem = int(deadline - time.time())
+                self.log(f"RE-LOOP: waiting for a recovery screen ({rem}s left)...")
+                time.sleep(2)
+
+            if found is None:
+                self.log(f"RE-LOOP: none of the 5 screens showed up. Falling back to mainstage.")
+                self.wait_and_click("img/mainstage.png", timeout=30)
+                return "resume"
+
+            self.log(f"RE-LOOP: matched {found}.")
+
+            # check1-reloop: sp-stage -> ESC until cancel -> skip -> skipok -> mainstage
+            if found == "check1":
+                self.wait_and_click("img/heyquest1/sp-stage.bmp", timeout=15)
+                self._spam_until("img/cancel.png", action="esc", label="RE-LOOP check1 ESC")
+                self.wait_and_click("img/skip.png", timeout=15)
+                self.wait_and_click("img/skipok.png", timeout=15)
+                self.wait_and_click("img/mainstage.png", timeout=30)
+                return "resume"
+
+            # check2-reloop: skipnew -> skipok -> sp-stage until cancel -> mainstage
+            if found == "check2":
+                self.wait_and_click("img/heyquest2/skipnew.bmp", timeout=15)
+                self.wait_and_click("img/skipok.png", timeout=15)
+                self._spam_until("img/cancel.png", action="img/heyquest2/sp-stage.bmp",
+                                 label="RE-LOOP check2 sp-stage")
+                self.wait_and_click("img/mainstage.png", timeout=30)
+                return "resume"
+
+            # heygacha / heygacha2 / heybrown: same cutscene skip, different restart point
+            self.wait_and_click("img/skip.png", timeout=15)
+            self.wait_and_click("img/skipok.png", timeout=15)
+            if found == "heybrown":
+                self.log(f"RE-LOOP: restarting from egear1.")
+                return "egear"
+            self.log(f"RE-LOOP: restarting from gacha.")
+            return "gacha"
+        finally:
+            self._in_reloop = False
+            self.last_activity_time = time.time()
 
     def verify_account_level_once(self, timeout=30):
         """Run the account level gate EXACTLY ONCE, right after login (stoplogin found).
@@ -1506,60 +1619,71 @@ class BotInstance:
             wc("img/skip.png", 30)
             wc("img/skipok.png", 15)
             
-            # gacha1 -> gacha2 10s -> skip -> skipok
-            wc("img/gacha1.png", 30)
-            wc("img/gacha2.png", 30)
-            wc("img/skip.png", 15)
-            wc("img/skipok.png", 15)
+            def _stage12_gacha_seq():
+                # gacha1 -> gacha2 10s -> skip -> skipok
+                wc("img/gacha1.png", 30)
+                wc("img/gacha2.png", 30)
+                wc("img/skip.png", 15)
+                wc("img/skipok.png", 15)
             
-            # gear1-gear5 -> skip -> skipok
-            for g in range(1, 6):
-                wc(f"img/gear{g}.png", 15)
-            wc("img/skip.png", 15)
-            wc("img/skipok.png", 15)
+                # gear1-gear5 -> skip -> skipok
+                for g in range(1, 6):
+                    wc(f"img/gear{g}.png", 15)
+                wc("img/skip.png", 15)
+                wc("img/skipok.png", 15)
             
-            # gearep1 -> skip -> 10s wait -> skipok
-            wc("img/gearep1.png", 300)
-            wc("img/skip.png", 15)
-            time.sleep(10)
-            wc("img/skipok.png", 15)
+                # gearep1 -> skip -> 10s wait -> skipok
+                wc("img/gearep1.png", 300)
+                wc("img/skip.png", 15)
+                time.sleep(10)
+                wc("img/skipok.png", 15)
             
-            # skip -> skipok before hunting gearep2 (a cutscene can sit in front of it)
-            wc("img/skip.png", 15)
-            wc("img/skipok.png", 15)
+                # skip -> skipok before hunting gearep2 (a cutscene can sit in front of it)
+                wc("img/skip.png", 15)
+                wc("img/skipok.png", 15)
 
-            # gearep2 -> skip -> skipok
-            wc("img/gearep2.png", 300)
-            wc("img/skip.png", 15)
-            wc("img/skipok.png", 15)
+                # gearep2 -> skip -> skipok
+                wc("img/gearep2.png", 300)
+                wc("img/skip.png", 15)
+                wc("img/skipok.png", 15)
             
-            # fixgear4-1 -> gearep3 -> repeat tap position 5 times
-            pos_fg = wc("img/fixgear4-1.png", 30)
-            if pos_fg:
-                self.log(f"Repeating tap on fixgear4-1 x4...")
-                for _ in range(4):
-                    self.tap(pos_fg[0], pos_fg[1], label="fixgear4-1-repeat")
+                # fixgear4-1 -> gearep3 -> repeat tap position 5 times
+                pos_fg = wc("img/fixgear4-1.png", 30)
+                if pos_fg:
+                    self.log(f"Repeating tap on fixgear4-1 x4...")
+                    for _ in range(4):
+                        self.tap(pos_fg[0], pos_fg[1], label="fixgear4-1-repeat")
+                        time.sleep(0.5)
+            
+                pos_g3 = wc("img/gearep3.png", 50)
+                if pos_g3:
+                    self.log(f"Repeating tap on gearep3 x9...")
+                    for _ in range(9):
+                        self.tap(pos_g3[0], pos_g3[1], label="gearep3-repeat")
+                        time.sleep(0.5)
+            
+                # gearep4 -> skip -> skip 10s -> backgearep1 -> mainstage
+                wc("img/gearep4.png", 300)
+                wc("img/skip.png", 30)
+                wc("img/skipok.png",30)
+                time.sleep(10)
+            
+                self.log(f"Stage 12: Tapping backgearep1.png until gone...")
+                while wc("img/backgearep1.png", 5):
                     time.sleep(0.5)
+                wc("img/mainstage.png", 80)
             
-            pos_g3 = wc("img/gearep3.png", 50)
-            if pos_g3:
-                self.log(f"Repeating tap on gearep3 x9...")
-                for _ in range(9):
-                    self.tap(pos_g3[0], pos_g3[1], label="gearep3-repeat")
-                    time.sleep(0.5)
-            
-            # gearep4 -> skip -> skip 10s -> backgearep1 -> mainstage
-            wc("img/gearep4.png", 300)
-            wc("img/skip.png", 30)
-            wc("img/skipok.png",30)
-            time.sleep(10)
-            
-            self.log(f"Stage 12: Tapping backgearep1.png until gone...")
-            while wc("img/backgearep1.png", 5):
-                time.sleep(0.5)
-            wc("img/mainstage.png", 80)
-            
-            self.log(f"=== STAGE 12 SEQUENCE FINISHED ===")
+                self.log(f"=== STAGE 12 SEQUENCE FINISHED ===")
+                return True
+
+            # A stall in here means RE-LOOP sends us back to the start of the gacha run
+            while True:
+                try:
+                    _stage12_gacha_seq()
+                    break
+                except StallDetected:
+                    self.log(f"Stage 12: stall during gacha -> RE-LOOP, then restarting from gacha1...")
+                    self.handle_reloop()
             return True
 
         # ============================================================
@@ -1592,42 +1716,53 @@ class BotInstance:
             self.log(f"Stage 15: Starting Exact Sequential Logic...")
             wc("img/skip.png", 50); wc("img/skip.png", 50); wc("img/skipok.png", 50)
             # Loop egear1 -> 5 indefinitely until found, then tap until gone
-            last_eg5_pos = None
-            for img_name in ["egear1.png", "egear2.png", "egear3.png", "egear4.png", "egear5.png"]:
-                self.log(f"Waiting indefinitely for {img_name}...")
-                while True:
-                    self.capture_screen()
-                    p = self.find_image(f"img/{img_name}", 0.8)
-                    if p: break
-                    time.sleep(0.5)
+            def _stage15_egear_seq():
+                last_eg5_pos = None
+                for img_name in ["egear1.png", "egear2.png", "egear3.png", "egear4.png", "egear5.png"]:
+                    self.log(f"Waiting indefinitely for {img_name}...")
+                    while True:
+                        self.capture_screen()
+                        p = self.find_image(f"img/{img_name}", 0.8)
+                        if p: break
+                        time.sleep(0.5)
 
-                self.log(f"Found {img_name}, looping until gone...")
-                while True:
-                    self.capture_screen()
-                    p = self.find_image(f"img/{img_name}", 0.8)
-                    if p:
-                        self.tap(p[0], p[1], label=f"loop-{img_name}")
-                        if img_name == "egear5.png": last_eg5_pos = p
-                        time.sleep(0.5); continue
-                    break
-            # 8 extra taps on egear5 position
-            if last_eg5_pos:
-                self.log(f"Delaying 2s before eg5 extra taps...")
-                time.sleep(2)
-                for _ in range(8): 
-                    self.tap(last_eg5_pos[0], last_eg5_pos[1], label="eg5-repeat")
-                    time.sleep(2.0)
+                    self.log(f"Found {img_name}, looping until gone...")
+                    while True:
+                        self.capture_screen()
+                        p = self.find_image(f"img/{img_name}", 0.8)
+                        if p:
+                            self.tap(p[0], p[1], label=f"loop-{img_name}")
+                            if img_name == "egear5.png": last_eg5_pos = p
+                            time.sleep(0.5); continue
+                        break
+                # 8 extra taps on egear5 position
+                if last_eg5_pos:
+                    self.log(f"Delaying 2s before eg5 extra taps...")
+                    time.sleep(2)
+                    for _ in range(8): 
+                        self.tap(last_eg5_pos[0], last_eg5_pos[1], label="eg5-repeat")
+                        time.sleep(2.0)
             
-            wc("img/skip.png", 15); wc("img/skipok.png", 15)
+                wc("img/skip.png", 15); wc("img/skipok.png", 15)
 
-            # Loop backegear until gone
-            self.log(f"Looping backegear.png until gone...")
+                # Loop backegear until gone
+                self.log(f"Looping backegear.png until gone...")
+                while True:
+                    self.capture_screen()
+                    pb = self.find_image("img/backegear.png", 0.8)
+                    if pb: self.tap(pb[0], pb[1], label="backegear"); time.sleep(0.5); continue
+                    break
+                wc("img/mainstage.png")
+                return True
+
+            # A stall in here means RE-LOOP sends us back to the start of the egear run
             while True:
-                self.capture_screen()
-                pb = self.find_image("img/backegear.png", 0.8)
-                if pb: self.tap(pb[0], pb[1], label="backegear"); time.sleep(0.5); continue
-                break
-            wc("img/mainstage.png")
+                try:
+                    _stage15_egear_seq()
+                    break
+                except StallDetected:
+                    self.log(f"Stage 15: stall during egear -> RE-LOOP, then restarting from egear1...")
+                    self.handle_reloop()
             return True
 
         # ============================================================
@@ -2125,292 +2260,310 @@ class BotInstance:
                         {"num": 31, "img": "img/stage/num31.png",      "region": (0, 0, 800, 600)},
                     ]
 
-                    for stage_info in stage_sequence:
-                        target_img = stage_info["img"]
-                        region     = stage_info["region"]
-                        stage_num  = stage_info["num"]
+                    stage_idx = 0
+                    while stage_idx < len(stage_sequence):
+                        stage_info = stage_sequence[stage_idx]
+                        try:
+                            target_img = stage_info["img"]
+                            region     = stage_info["region"]
+                            stage_num  = stage_info["num"]
 
-                        # Stage 5 can leave a cutscene + the 7-day popup in front of the map
-                        if stage_num == 6:
-                            self.log(f"Before Stage 6: Clearing skip / skipok (2 rounds, 15s each), then 7day...")
-                            for r in (1, 2):
-                                self.log(f"Before Stage 6: skip / skipok round {r}/2...")
-                                self.wait_and_click("img/skip.png", timeout=15)
-                                self.wait_and_click("img/skipok.png", timeout=15)
-                            # Entry is 7day1.png (plain 7day.png is never tapped)
-                            self.run_7day_flow("Before Stage 6", timeout_first=15, timeout_rest=10)
+                            # Stage 5 can leave a cutscene + the 7-day popup in front of the map
+                            if stage_num == 6:
+                                self.log(f"Before Stage 6: Clearing skip / skipok (2 rounds, 15s each), then 7day...")
+                                for r in (1, 2):
+                                    self.log(f"Before Stage 6: skip / skipok round {r}/2...")
+                                    self.wait_and_click("img/skip.png", timeout=15)
+                                    self.wait_and_click("img/skipok.png", timeout=15)
+                                # Entry is 7day1.png (plain 7day.png is never tapped)
+                                self.run_7day_flow("Before Stage 6", timeout_first=15, timeout_rest=10)
 
-                        # Level-up (update) screen can appear after Stage 6 -> handle it before hunting Stage 7
-                        if stage_num == 7:
-                            self.run_update_flow("Before Stage 7", timeout=60, finish_always=False)
+                            # Level-up (update) screen can appear after Stage 6 -> handle it before hunting Stage 7
+                            if stage_num == 7:
+                                self.run_update_flow("Before Stage 7", timeout=60, finish_always=False)
 
-                        self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
+                            self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
 
-                        retry_find_stage = 0
-                        stage_notfound_count = 0
-                        while True:
-                            self.capture_screen()
-                            pos_q151 = self.find_image("img/stage151.png", threshold=0.95)
-                            if pos_q151:
-                                self.log(f"!!! STAGE 151 DETECTED !!! Triggering Routine...")
-                                if not self.handle_quest_151():
-                                    raise AccountFinished()
-                                continue
-
-                            on_map = self.find_image("img/waitmainstage.png")
-
-                            if not on_map:
-                                self.log(f"Not on map. Checking for mainstage button...")
-                                pos_main = self.find_image("img/mainstage.png", threshold=0.7)
-                                if pos_main:
-                                    self.log(f"Clicking mainstage button...")
-                                    self.tap(pos_main[0], pos_main[1])
-                                    self.wait_for_image("img/waitmainstage.png", timeout=15)
-                                    time.sleep(2)
-                                    self.capture_screen()
-                                else:
-                                    self.log(f"Cannot find map marker or mainstage button. Retrying...")
-                                    retry_find_stage += 1
-                                    if retry_find_stage >= 10:
-                                        self.log(f"RECOVERY: Stuck 10 times. Clicking backmainstage.png...")
-                                        self.wait_and_click("img/backmainstage.png", timeout=5)
-                                        retry_find_stage = 0
-                                    time.sleep(2)
+                            retry_find_stage = 0
+                            stage_notfound_count = 0
+                            while True:
+                                self.capture_screen()
+                                pos_q151 = self.find_image("img/stage151.png", threshold=0.95)
+                                if pos_q151:
+                                    self.log(f"!!! STAGE 151 DETECTED !!! Triggering Routine...")
+                                    if not self.handle_quest_151():
+                                        raise AccountFinished()
                                     continue
 
-                            # Default 0.80 for all stages
-                            search_threshold = 0.80
-                            self.log(f"Searching for {target_img} in region with threshold {search_threshold}...")
-                            pos = self.find_image_in_region(target_img, region, threshold=search_threshold)
+                                on_map = self.find_image("img/waitmainstage.png")
 
-                            if pos:
-                                # Safety Check: Prevent falsely clicking chest1.png if it overlaps our target
-                                is_chest = False
-                                if self.screen_bgr is not None and os.path.exists("img/chest1.png"):
-                                    template_chest = cv2.imread("img/chest1.png", cv2.IMREAD_COLOR)
-                                    if template_chest is not None:
-                                        res_chest = cv2.matchTemplate(self.screen_bgr, template_chest, cv2.TM_CCOEFF_NORMED)
-                                        loc_chest = np.where(res_chest >= 0.70)
-                                        import math
-                                        for pt in zip(*loc_chest[::-1]):
-                                            cx = int(pt[0] + template_chest.shape[1]/2)
-                                            cy = int(pt[1] + template_chest.shape[0]/2)
-                                            if math.hypot(pos[0] - cx, pos[1] - cy) < 40:
-                                                is_chest = True
-                                                break
-                                if is_chest:
-                                    self.log(f"WARNING: Target matches chest1.png! Ignoring false positive.")
-                                    time.sleep(1)
-                                    continue
-
-                            if pos:
-                                if stage_num == 31:
-                                    self.log(f"Entering STAGE 31+ LOOP SYSTEM...")
-                                    start_from_side = False
-                                    
-                                    while True:
+                                if not on_map:
+                                    self.log(f"Not on map. Checking for mainstage button...")
+                                    pos_main = self.find_image("img/mainstage.png", threshold=0.7)
+                                    if pos_main:
+                                        self.log(f"Clicking mainstage button...")
+                                        self.tap(pos_main[0], pos_main[1])
+                                        self.wait_for_image("img/waitmainstage.png", timeout=15)
+                                        time.sleep(2)
                                         self.capture_screen()
-                                        if self.find_image("img/stage151.png", threshold=0.95):
-                                            if not self.handle_quest_151():
-                                                raise AccountFinished()
-                                            continue
+                                    else:
+                                        self.log(f"Cannot find map marker or mainstage button. Retrying...")
+                                        retry_find_stage += 1
+                                        if retry_find_stage >= 10:
+                                            self.log(f"RECOVERY: Stuck 10 times. Clicking backmainstage.png...")
+                                            self.wait_and_click("img/backmainstage.png", timeout=5)
+                                            retry_find_stage = 0
+                                        time.sleep(2)
+                                        continue
 
-                                        self.log(f">>> Phase 1: Navigating (Dictionary Loop Mode)...")
+                                # Default 0.80 for all stages
+                                search_threshold = 0.80
+                                self.log(f"Searching for {target_img} in region with threshold {search_threshold}...")
+                                pos = self.find_image_in_region(target_img, region, threshold=search_threshold)
+
+                                if pos:
+                                    # Safety Check: Prevent falsely clicking chest1.png if it overlaps our target
+                                    is_chest = False
+                                    if self.screen_bgr is not None and os.path.exists("img/chest1.png"):
+                                        template_chest = cv2.imread("img/chest1.png", cv2.IMREAD_COLOR)
+                                        if template_chest is not None:
+                                            res_chest = cv2.matchTemplate(self.screen_bgr, template_chest, cv2.TM_CCOEFF_NORMED)
+                                            loc_chest = np.where(res_chest >= 0.70)
+                                            import math
+                                            for pt in zip(*loc_chest[::-1]):
+                                                cx = int(pt[0] + template_chest.shape[1]/2)
+                                                cy = int(pt[1] + template_chest.shape[0]/2)
+                                                if math.hypot(pos[0] - cx, pos[1] - cy) < 40:
+                                                    is_chest = True
+                                                    break
+                                    if is_chest:
+                                        self.log(f"WARNING: Target matches chest1.png! Ignoring false positive.")
+                                        time.sleep(1)
+                                        continue
+
+                                if pos:
+                                    if stage_num == 31:
+                                        self.log(f"Entering STAGE 31+ LOOP SYSTEM...")
+                                        start_from_side = False
+                                    
+                                        while True:
+                                            self.capture_screen()
+                                            if self.find_image("img/stage151.png", threshold=0.95):
+                                                if not self.handle_quest_151():
+                                                    raise AccountFinished()
+                                                continue
+
+                                            self.log(f">>> Phase 1: Navigating (Dictionary Loop Mode)...")
                                         
-                                        if start_from_side or self.is_first_31:
-                                            self.log(f"[Jump Recover] Checking nextstage -> nextnew before side...")
-                                            self.process_sequence([
-                                                {"img": "img/nextstage.png", "loop": True, "timeout": 10},
-                                                {"img": "img/nextnew.png",   "loop": True, "timeout": 10}
-                                            ])
-                                            start_from_side = False
-                                            if self.is_first_31:
-                                                p31 = self.find_image_in_region("img/stage/num31.png", region, threshold=0.8)
-                                                if p31: 
-                                                    self.tap(p31[0], p31[1], label="stage-31-icon (tap 1)")
-                                                    time.sleep(1)
-                                                    self.tap(p31[0], p31[1], label="stage-31-icon (tap 2)")
-                                                    # NEW: After num31, must click next.png
-                                                    self.wait_and_click("img/next.png", timeout=10)
-                                        else:
-                                            inner_nav_success = False
-                                            while not inner_nav_success:
-                                                self.log(f"[Pre-Nav Loop] Checking clearstop -> nextstage -> nextnew...")
+                                            if start_from_side or self.is_first_31:
+                                                self.log(f"[Jump Recover] Checking nextstage -> nextnew before side...")
                                                 self.process_sequence([
-                                                    {"img": "img/clearstop.png", "loop": True, "timeout": 10},
                                                     {"img": "img/nextstage.png", "loop": True, "timeout": 10},
                                                     {"img": "img/nextnew.png",   "loop": True, "timeout": 10}
                                                 ])
-                                                self.capture_screen()
-                                                if self.find_image("img/side.png", 0.8) or self.find_image("img/buyhelp.png", 0.8) or self.find_image("img/startnew.png", 0.8):
-                                                    self.log(f"Map context verified. Proceeding to main Navigation Sequence...")
-                                                    inner_nav_success = True
-                                                    break
-                                                self.log(f"Not on Map yet! Looping back to clearstop -> nextstage -> nextnew (Timeout 10s)...")
+                                                start_from_side = False
+                                                if self.is_first_31:
+                                                    p31 = self.find_image_in_region("img/stage/num31.png", region, threshold=0.8)
+                                                    if p31: 
+                                                        self.tap(p31[0], p31[1], label="stage-31-icon (tap 1)")
+                                                        time.sleep(1)
+                                                        self.tap(p31[0], p31[1], label="stage-31-icon (tap 2)")
+                                                        # NEW: After num31, must click next.png
+                                                        self.wait_and_click("img/next.png", timeout=10)
+                                            else:
+                                                inner_nav_success = False
+                                                while not inner_nav_success:
+                                                    self.log(f"[Pre-Nav Loop] Checking clearstop -> nextstage -> nextnew...")
+                                                    self.process_sequence([
+                                                        {"img": "img/clearstop.png", "loop": True, "timeout": 10},
+                                                        {"img": "img/nextstage.png", "loop": True, "timeout": 10},
+                                                        {"img": "img/nextnew.png",   "loop": True, "timeout": 10}
+                                                    ])
+                                                    self.capture_screen()
+                                                    if self.find_image("img/side.png", 0.8) or self.find_image("img/buyhelp.png", 0.8) or self.find_image("img/startnew.png", 0.8):
+                                                        self.log(f"Map context verified. Proceeding to main Navigation Sequence...")
+                                                        inner_nav_success = True
+                                                        break
+                                                    self.log(f"Not on Map yet! Looping back to clearstop -> nextstage -> nextnew (Timeout 10s)...")
+                                                    time.sleep(1)
+
+                                            # Core Battle Transition Seq
+                                            nav_seq = [
+                                                {"img": "img/side.png", "loop": True, "timeout": None},
+                                                {"img": "img/buyhelp.png", "loop": False, "timeout": None},
+                                                {"img": "img/startnew.png", "loop": True, "timeout": None}
+                                            ]
+                                            self.process_sequence(nav_seq)
+                                        
+                                            battle_res, battle_status = self.handle_battle_31()
+                                            if battle_status == "stop": raise AccountFinished()
+                                        
+                                            if battle_res:
+                                                res = self.handle_finish_31()
+                                                if res == "stop": raise AccountFinished()
+                                            
+                                                if self.is_first_31:
+                                                    self.log(f"STAGE 31 SPECIAL AFTER CLEAR (som -> nextstage -> autoadvance1 -> 751,505x8)")
+                                                    self.wait_and_click("img/som.png", timeout=15)
+                                                    pos_ns = self.wait_and_click("img/nextstage.png", timeout=10)
+                                                    if pos_ns: 
+                                                        time.sleep(0.5); self.tap(pos_ns[0], pos_ns[1], label="nextstage_repeat")
+                                                    self.wait_and_click("img/autoadvance.png", timeout=10)
+                                                    for _ in range(8):
+                                                        self.tap(751, 505, label="special_pos_751_505")
+                                                        time.sleep(0.3)
+                                                    self.is_first_31 = False
+
+                                                if res == "jump":
+                                                    self.log(f"JUMP executed! Returning directly to Side...")
+                                                    start_from_side = True
+                                        
+                                            time.sleep(1)
+                                        # End of Stage 31 loop
+                                
+                                    else:
+                                        # --- Standard Stage Handling (Non-31) ---
+                                        if stage_num in [22, 23, 28]:
+                                            self.log(f"Stage {stage_num}: Waiting 10s for screen scroll to settle...")
+                                            time.sleep(10)
+                                            self.log(f"Stage {stage_num}: Re-detecting final position...")
+                                            pos_settled = self.find_image_in_region(target_img, region, threshold=search_threshold)
+                                            if pos_settled:
+                                                pos = pos_settled
+                                            else:
+                                                self.log(f"Stage {stage_num}: Lost target after settle! Retrying loop...")
+                                                continue
+
+                                        self.log(f"Found stage {stage_num} image, tapping...")
+
+                                        if stage_num == 5:
+                                            self.log(f"Stage 5: Checking for event version (eventstage5.png) in region...")
+                                            pos_ev = self.find_image_in_region("img/eventstage5.png", region, threshold=0.8)
+                                            if pos_ev:
+                                                self.log(f"Found event version for Stage 5 on map! Using that.")
+                                                pos = pos_ev
+
+                                        self.tap(pos[0], pos[1])
+                                        time.sleep(1)
+
+                                        if stage_num == 10:
+                                            self.log(f"Stage 10 special: Checking for drag1...")
+                                            time.sleep(1)
+                                            pos_drag = self.find_image("img/drag1.png", threshold=0.8)
+                                            if pos_drag:
+                                                self.log(f"Found drag1, performing dynamic drag to 258, 444...")
+                                                self.swipe(pos_drag[0], pos_drag[1], 258, 444, duration=1500)
                                                 time.sleep(1)
 
-                                        # Core Battle Transition Seq
-                                        nav_seq = [
-                                            {"img": "img/side.png", "loop": True, "timeout": None},
-                                            {"img": "img/buyhelp.png", "loop": False, "timeout": None},
-                                            {"img": "img/startnew.png", "loop": True, "timeout": None}
-                                        ]
-                                        self.process_sequence(nav_seq)
+                                        if stage_num == 13:
+                                            self.log(f"=== STAGE 13 SPECIAL START SEQUENCE ===")
+                                            time.sleep(2)
+                                            self.wait_and_click("img/checkstage1.png", timeout=10)
+                                            self.wait_and_click("img/start.png", timeout=5)
                                         
-                                        battle_res, battle_status = self.handle_battle_31()
-                                        if battle_status == "stop": raise AccountFinished()
-                                        
-                                        if battle_res:
-                                            res = self.handle_finish_31()
-                                            if res == "stop": raise AccountFinished()
-                                            
-                                            if self.is_first_31:
-                                                self.log(f"STAGE 31 SPECIAL AFTER CLEAR (som -> nextstage -> autoadvance1 -> 751,505x8)")
-                                                self.wait_and_click("img/som.png", timeout=15)
-                                                pos_ns = self.wait_and_click("img/nextstage.png", timeout=10)
-                                                if pos_ns: 
-                                                    time.sleep(0.5); self.tap(pos_ns[0], pos_ns[1], label="nextstage_repeat")
-                                                self.wait_and_click("img/autoadvance.png", timeout=10)
-                                                for _ in range(8):
-                                                    self.tap(751, 505, label="special_pos_751_505")
-                                                    time.sleep(0.3)
-                                                self.is_first_31 = False
+                                            # Wait for battle load then check auto1
+                                            self.log(f"Simulating Stage 13 Battle (check auto1)...")
+                                            time.sleep(5)
+                                            pos_auto = self.wait_and_click("img/auto1.png", timeout=5, threshold=0.8)
+                                            if pos_auto:
+                                                self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-1")
+                                                self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-2")
+                                            break
 
-                                            if res == "jump":
-                                                self.log(f"JUMP executed! Returning directly to Side...")
-                                                start_from_side = True
-                                        
-                                        time.sleep(1)
-                                    # End of Stage 31 loop
-                                
-                                else:
-                                    # --- Standard Stage Handling (Non-31) ---
-                                    if stage_num in [22, 23, 28]:
-                                        self.log(f"Stage {stage_num}: Waiting 10s for screen scroll to settle...")
-                                        time.sleep(10)
-                                        self.log(f"Stage {stage_num}: Re-detecting final position...")
-                                        pos_settled = self.find_image_in_region(target_img, region, threshold=search_threshold)
-                                        if pos_settled:
-                                            pos = pos_settled
-                                        else:
-                                            self.log(f"Stage {stage_num}: Lost target after settle! Retrying loop...")
-                                            continue
+                                        if stage_num == 25:
+                                            self.log(f"Stage 25 special: Finding checkpoint2.png (timeout 5s)...")
+                                            if self.wait_and_click("img/checkpoint2.png", timeout=5):
+                                                self.log(f"Found! Looping checkpoint2 until gone...")
+                                                while self.wait_and_click("img/checkpoint2.png", timeout=3): pass
 
-                                    self.log(f"Found stage {stage_num} image, tapping...")
+                                        if stage_num == 30:
+                                            self.log(f"Stage 30 special start sequence...")
+                                            stage30_seq = [
+                                                {"img": "img/next.png",    "loop": True,  "timeout": None},
+                                                {"img": "img/skip.png",    "loop": False, "timeout": None},
+                                                {"img": "img/skipok.png",  "loop": False, "timeout": None},
+                                                {"img": "img/friends.png", "loop": True,  "timeout": None, "max_clicks": 5},
+                                                {"img": "img/start.png",   "loop": True,  "timeout": 30},
+                                                {"img": "img/push.png",    "loop": True,  "timeout": None}
+                                            ]
+                                            self.process_sequence(stage30_seq)
+                                            self.log(f"Stage 30 logic completed, moving to battle.")
+                                            break
 
-                                    if stage_num == 5:
-                                        self.log(f"Stage 5: Checking for event version (eventstage5.png) in region...")
-                                        pos_ev = self.find_image_in_region("img/eventstage5.png", region, threshold=0.8)
-                                        if pos_ev:
-                                            self.log(f"Found event version for Stage 5 on map! Using that.")
-                                            pos = pos_ev
+                                        if self.wait_and_click("img/start.png", timeout=5):
+                                            break
 
-                                    self.tap(pos[0], pos[1])
-                                    time.sleep(1)
+                                    stage_notfound_count += 1
+                                    self.log(f"Stage {stage_num} image not found. (Retry: {stage_notfound_count}/5)")
 
-                                    if stage_num == 10:
-                                        self.log(f"Stage 10 special: Checking for drag1...")
-                                        time.sleep(1)
-                                        pos_drag = self.find_image("img/drag1.png", threshold=0.8)
-                                        if pos_drag:
-                                            self.log(f"Found drag1, performing dynamic drag to 258, 444...")
-                                            self.swipe(pos_drag[0], pos_drag[1], 258, 444, duration=1500)
-                                            time.sleep(1)
+                                    # Stage 6 hidden 5 times in a row -> quest / 7day popup is usually in the way
+                                    if stage_num == 6 and stage_notfound_count >= 5:
+                                        self.log(f"Stage 6 not found 5 times -> Detour: quest -> BACK -> 7day -> mainstage...")
+                                        self.run_stage6_detour("Before Stage 6")
+                                        stage_notfound_count = 0
 
-                                    if stage_num == 13:
-                                        self.log(f"=== STAGE 13 SPECIAL START SEQUENCE ===")
-                                        time.sleep(2)
-                                        self.wait_and_click("img/checkstage1.png", timeout=10)
-                                        self.wait_and_click("img/start.png", timeout=5)
-                                        
-                                        # Wait for battle load then check auto1
-                                        self.log(f"Simulating Stage 13 Battle (check auto1)...")
-                                        time.sleep(5)
-                                        pos_auto = self.wait_and_click("img/auto1.png", timeout=5, threshold=0.8)
-                                        if pos_auto:
-                                            self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-1")
-                                            self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-2")
-                                        break
+                            hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
 
-                                    if stage_num == 25:
-                                        self.log(f"Stage 25 special: Finding checkpoint2.png (timeout 5s)...")
-                                        if self.wait_and_click("img/checkpoint2.png", timeout=5):
-                                            self.log(f"Found! Looping checkpoint2 until gone...")
-                                            while self.wait_and_click("img/checkpoint2.png", timeout=3): pass
+                            if stage_num == 13:
+                                self.log(f"Stage 13 Battle Logic: checking auto1 (wait 5s)...")
+                                pos_auto = self.wait_and_click("img/auto1.png", timeout=5, threshold=0.8)
+                                if pos_auto:
+                                    self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-1")
+                                    self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-2")
+                                    time.sleep(0.5)
 
-                                    if stage_num == 30:
-                                        self.log(f"Stage 30 special start sequence...")
-                                        stage30_seq = [
-                                            {"img": "img/next.png",    "loop": True,  "timeout": None},
-                                            {"img": "img/skip.png",    "loop": False, "timeout": None},
-                                            {"img": "img/skipok.png",  "loop": False, "timeout": None},
-                                            {"img": "img/friends.png", "loop": True,  "timeout": None, "max_clicks": 5},
-                                            {"img": "img/start.png",   "loop": True,  "timeout": 30},
-                                            {"img": "img/push.png",    "loop": True,  "timeout": None}
-                                        ]
-                                        self.process_sequence(stage30_seq)
-                                        self.log(f"Stage 30 logic completed, moving to battle.")
-                                        break
+                            win_detected = False
+                            stop_spam = False
 
-                                    if self.wait_and_click("img/start.png", timeout=5):
-                                        break
+                            def spam_heroes():
+                                self.log(f"[Machine-Gun] Tapping started!")
+                                burst_coords = hero_coords * 2
+                                tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst_coords]) + " & wait"
+                                while not stop_spam:
+                                    subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", tap_chain], **self.kwargs)
+                                    time.sleep(0.01)
 
-                                stage_notfound_count += 1
-                                self.log(f"Stage {stage_num} image not found. (Retry: {stage_notfound_count}/5)")
+                            spam_thread = Thread(target=spam_heroes)
+                            spam_thread.start()
 
-                                # Stage 6 hidden 5 times in a row -> quest / 7day popup is usually in the way
-                                if stage_num == 6 and stage_notfound_count >= 5:
-                                    self.log(f"Stage 6 not found 5 times -> Detour: quest -> BACK -> 7day -> mainstage...")
-                                    self.run_stage6_detour("Before Stage 6")
-                                    stage_notfound_count = 0
-
-                        hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
-
-                        if stage_num == 13:
-                            self.log(f"Stage 13 Battle Logic: checking auto1 (wait 5s)...")
-                            pos_auto = self.wait_and_click("img/auto1.png", timeout=5, threshold=0.8)
-                            if pos_auto:
-                                self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-1")
-                                self.tap(pos_auto[0], pos_auto[1], label="auto1-repeat-2")
-                                time.sleep(0.5)
-
-                        win_detected = False
-                        stop_spam = False
-
-                        def spam_heroes():
-                            self.log(f"[Machine-Gun] Tapping started!")
-                            burst_coords = hero_coords * 2
-                            tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst_coords]) + " & wait"
-                            while not stop_spam:
-                                subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", tap_chain], **self.kwargs)
-                                time.sleep(0.01)
-
-                        spam_thread = Thread(target=spam_heroes)
-                        spam_thread.start()
-
-                        while not win_detected:
-                            for i in [2, 1]:
+                            while not win_detected:
+                                for i in [2, 1]:
+                                    self.capture_screen()
+                                    pos = self.find_image(f"img/useitem{i}.png")
+                                    if pos: self.tap(pos[0], pos[1])
+                                time.sleep(3)
                                 self.capture_screen()
-                                pos = self.find_image(f"img/useitem{i}.png")
-                                if pos: self.tap(pos[0], pos[1])
-                            time.sleep(3)
-                            self.capture_screen()
-                            pos3 = self.find_image("img/useitem3.png")
-                            if pos3: self.tap(pos3[0], pos3[1])
-                            time.sleep(3)
-                            self.capture_screen()
-                            pos4 = self.find_image("img/useitem4.png")
-                            if pos4: self.tap(pos4[0], pos4[1])
+                                pos3 = self.find_image("img/useitem3.png")
+                                if pos3: self.tap(pos3[0], pos3[1])
+                                time.sleep(3)
+                                self.capture_screen()
+                                pos4 = self.find_image("img/useitem4.png")
+                                if pos4: self.tap(pos4[0], pos4[1])
 
-                            self.capture_screen()
-                            if self.find_image("img/win.png"):
-                                self.log(f"WIN detected!")
-                                stop_spam = True
-                                win_detected = True
-                                break
+                                self.capture_screen()
+                                if self.find_image("img/win.png"):
+                                    self.log(f"WIN detected!")
+                                    stop_spam = True
+                                    win_detected = True
+                                    break
 
-                        spam_thread.join()
-                        self.handle_clear_routine(stage_num)
+                            spam_thread.join()
+                            self.handle_clear_routine(stage_num)
+                        except StallDetected:
+                            # A stall can land mid-battle, so stop the tap thread before recovering
+                            stop_spam = True
+                            try:
+                                spam_thread.join(timeout=5)
+                            except Exception:
+                                pass
+                            self.log(f"STALL on stage {stage_info['num']}: running RE-LOOP, then retrying this stage...")
+                            self.handle_reloop()
+                            continue
+                        stage_idx += 1
+                except StallDetected:
+                    self.log(f"STALL outside the stage loop: running RE-LOOP, then retrying this account...")
+                    self.handle_reloop()
+                    continue
                 except GameCrashed:
                     if not os.path.exists(os.path.join("backup", fname)):
                         self.log(f"RECOVERY: Account file {fname} no longer in backup/ (moved or removed). Switching to next account...")
