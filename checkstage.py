@@ -772,6 +772,10 @@ class BotInstance:
         if not getattr(self, "_in_popup_check", False):
             self._in_popup_check = True
             try:
+                # Network popups can hit at any time, including mid-stage long after
+                # login, so this one is never gated on login_done.
+                self.check_network_popups()
+
                 if not getattr(self, "login_done", False):
                     self.check_floating_popups()
                 
@@ -902,15 +906,67 @@ class BotInstance:
             self.log(f"Raw capture error: {e}")
         return False
 
+    def check_network_popups(self):
+        """The fixnet family ("Unstable network connection / retry"). Checked before every
+        other popup and on every capture, logged in or not: a network popup sits on top of
+        everything, so nothing else can be found or clicked until it is gone.
+        Returns True if one was handled."""
+        found_any = False
+
+        # fixnetv2.png: Network/Retry Sequence
+        if self.exists_in_cache("img/fixnetv2.png"):
+            self.log(f"[POPUP] fixnetv2.png detected! Executing retry clicks...")
+            if self.exists_in_cache("img/cancel.png"):
+                self.click("img/cancel.png"); time.sleep(1); self._raw_capture()
+
+            if self.click("img/fixnetv2.png"):
+                time.sleep(3)
+                self.click("img/fixnetv2ok.png")
+                time.sleep(2)
+            found_any = True
+
+        # fixnet.png: General Connection Error
+        if self.exists_in_cache("img/fixnet.png"):
+            self.log(f"[POPUP] fixnet.png detected! Clicking OK Reset...")
+            if self.exists_in_cache("img/cancel.png"):
+                self.click("img/cancel.png"); time.sleep(1); self._raw_capture()
+            self.click("img/oknet.png")
+            time.sleep(2)
+            found_any = True
+
+        # fixnet1.png: Secondary Connection Error
+        if self.exists_in_cache("img/fixnet1.png"):
+            self.log(f"[POPUP] fixnet1.png detected! Tapping (476, 394)...")
+            self.tap(476, 394)
+            time.sleep(2)
+            found_any = True
+
+        # fixnetv3.png: Force Restart Loop
+        if self.exists_in_cache("img/fixnetv3.png"):
+            self.log(f"[POPUP] fixnetv3.png detected! Incrementing restart count...")
+            self._fixnetv3_count += 1
+            if self._fixnetv3_count >= 3:
+                self.log(f"[RESTART] Hit 3x fixnetv3.png! Forcing bot restart...")
+                self._need_restart = True
+                self._fixnetv3_count = 0
+            self.click("img/fixnetv3.png")
+            time.sleep(2)
+            found_any = True
+
+        return found_any
+
     def check_floating_popups(self):
         """
-        Check and click floating popups (checkline / fixnetv2 / fixplay / fixnet1 / fixnetv3).
+        Check and click floating popups (fixnet family first, then checkline / fixplay / ...).
         Loops until no popups are found.
         """
         max_popups_iterations = 5
         for _ in range(max_popups_iterations):
-            found_any = False
-            
+            # Network popups always go first - they cover every other button on screen
+            found_any = self.check_network_popups()
+            if found_any:
+                self._raw_capture()
+
             # checkline.png: Handle Checkbox Popup Sequence
             if self.exists_in_cache("img/checkline.png"):
                 self.log(f"[POPUP] checkline.png detected! Running special sequence...")
@@ -967,52 +1023,12 @@ class BotInstance:
                     time.sleep(2)
                 found_any = True
 
-            # fixnetv2.png: Network/Retry Sequence
-            if self.exists_in_cache("img/fixnetv2.png"):
-                self.log(f"[POPUP] fixnetv2.png detected! Executing retry clicks...")
-                if self.exists_in_cache("img/cancel.png"): 
-                    self.click("img/cancel.png"); time.sleep(1); self._raw_capture()
-
-                if self.click("img/fixnetv2.png"):
-                    time.sleep(3)
-                    self.click("img/fixnetv2ok.png")
-                    time.sleep(2)
-                found_any = True
-
             # fixplay.png: Google Play Popup
             if self.exists_in_cache("img/fixplay.png"):
                 self.log(f"[POPUP] fixplay.png detected! Clicking OK...")
                 if self.exists_in_cache("img/cancel.png"): 
                     self.click("img/cancel.png"); time.sleep(1); self._raw_capture()
                 self.click("img/ok.png")
-                time.sleep(2)
-                found_any = True
-
-            # fixnet.png: General Connection Error
-            if self.exists_in_cache("img/fixnet.png"):
-                self.log(f"[POPUP] fixnet.png detected! Clicking OK Reset...")
-                if self.exists_in_cache("img/cancel.png"): 
-                    self.click("img/cancel.png"); time.sleep(1); self._raw_capture()
-                self.click("img/oknet.png")
-                time.sleep(2)
-                found_any = True
-
-            # fixnet1.png: Secondary Connection Error
-            if self.exists_in_cache("img/fixnet1.png"):
-                self.log(f"[POPUP] fixnet1.png detected! Tapping (476, 394)...")
-                self.tap(476, 394)
-                time.sleep(2)
-                found_any = True
-
-            # fixnetv3.png: Force Restart Loop
-            if self.exists_in_cache("img/fixnetv3.png"):
-                self.log(f"[POPUP] fixnetv3.png detected! Incrementing restart count...")
-                self._fixnetv3_count += 1
-                if self._fixnetv3_count >= 3:
-                    self.log(f"[RESTART] Hit 3x fixnetv3.png! Forcing bot restart...")
-                    self._need_restart = True
-                    self._fixnetv3_count = 0
-                self.click("img/fixnetv3.png")
                 time.sleep(2)
                 found_any = True
 
@@ -2358,6 +2374,13 @@ class BotInstance:
                             if stage_num == 7:
                                 self.run_update_flow("Before Stage 7", timeout=60, finish_always=False)
 
+                            # fixback.png can show up before Stage 23 -> tap it if it appears
+                            if stage_num == 23:
+                                self.log(f"Before Stage 23: searching for fixback.png (10s)...")
+                                if self.wait_and_click("img/fixback.png", timeout=10):
+                                    self.log(f"Clicked fixback.png before Stage 23.")
+                                    time.sleep(2)
+
                             self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
 
                             retry_find_stage = 0
@@ -2626,6 +2649,16 @@ class BotInstance:
 
                             spam_thread.join()
                             self.handle_clear_routine(stage_num)
+
+                            # Check for an event popup for 5s before moving to the next stage
+                            self.log(f"Stage {stage_num} done: checking for event (5s)...")
+                            ev_end = time.time() + 5
+                            while time.time() < ev_end:
+                                self.capture_screen()
+                                if self.handle_event_back():
+                                    self.log(f"Cleared an event popup after stage {stage_num}.")
+                                    break
+                                time.sleep(0.5)
                         except StallDetected:
                             # A stall can land mid-battle, so stop the tap thread before recovering
                             stop_spam = True
