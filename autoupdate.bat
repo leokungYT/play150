@@ -28,6 +28,14 @@ taskkill /f /im python.exe >nul 2>&1
 taskkill /f /im pythonw.exe >nul 2>&1
 timeout /t 3 /nobreak >nul
 
+:: VPN ทั้งเครื่อง (Windscribe / Cloudflare WARP ที่บอท main เปิดไว้) ทำให้ต่อ GitHub ไม่ได้ -> ตัดก่อนโหลด
+echo [PRE] Disconnecting PC-wide VPN (Windscribe / WARP) for the download...
+if exist "%ProgramFiles%\Windscribe\windscribe-cli.exe" ("%ProgramFiles%\Windscribe\windscribe-cli.exe" disconnect >nul 2>&1)
+if exist "%ProgramFiles(x86)%\Windscribe\windscribe-cli.exe" ("%ProgramFiles(x86)%\Windscribe\windscribe-cli.exe" disconnect >nul 2>&1)
+if exist "%ProgramFiles%\Cloudflare\Cloudflare WARP\warp-cli.exe" ("%ProgramFiles%\Cloudflare\Cloudflare WARP\warp-cli.exe" disconnect >nul 2>&1)
+ipconfig /flushdns >nul 2>&1
+timeout /t 3 /nobreak >nul
+
 set "TARGET_FOLDER=play150"
 set "REPO_URL=https://github.com/leokungYT/play150/archive/refs/heads/main.zip"
 set "ZIP_NAME=play150_update.zip"

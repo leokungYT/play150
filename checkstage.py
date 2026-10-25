@@ -611,39 +611,51 @@ def reset_network_all(devices):
 
 
 def _wg_import_keys_from_main():
-    """play150 ยังไม่มีกุญแจ Windscribe (wg_accounts/ ไม่ขึ้น git) -> ก๊อปจากโฟลเดอร์ main (LGR) ที่อยู่ข้างกัน
-    เอา wg_accounts/ ทั้งโฟลเดอร์ ; ถ้า main ไม่มี wg_accounts ใช้ไฟล์ .conf ใน main/wg/ 1 ไฟล์เป็นกุญแจสำรอง"""
+    """play150 ยังไม่มีกุญแจ Windscribe (wg_accounts/ ไม่ขึ้น git) -> หาจากโฟลเดอร์ main (LGR) บนเครื่อง
+    ค้นข้าง play150 และทั่ว Desktop ลึก 3 ชั้น: เอา wg_accounts/ ทั้งโฟลเดอร์ ; ไม่มีก็ใช้ .conf ใน wg/ 1 ไฟล์เป็นกุญแจ
+    คืน True = มีกุญแจพร้อมใช้"""
     here = os.path.dirname(os.path.abspath(__file__))
     acc = os.path.join(here, "wg_accounts")
-    if glob.glob(os.path.join(acc, "*", "*.conf")):
-        return
-    # main อาจอยู่ข้าง play150 หรือบน Desktop (autoupdate-lg ติดตั้งเป็น <โฟลเดอร์>\main ซ้อนอีกชั้น)
+    if (glob.glob(os.path.join(acc, "*", "*.conf"))
+            or glob.glob(os.path.join(here, str(config.get("wg_dir", "wg")), "*.conf"))):
+        return True
     bases = [os.path.dirname(here), os.path.join(os.path.expanduser("~"), "Desktop")]
-    cands = []
+    seen, found_acc, found_wg = set(), [], []
     for b in bases:
-        for pat in ("main", "LGR", os.path.join("main", "main"), os.path.join("*", "main"), os.path.join("LGR", "main")):
-            for d in glob.glob(os.path.join(b, pat)):
+        for depth in range(4):
+            mid = [b] + ["*"] * depth
+            for d in glob.glob(os.path.join(*mid, "wg_accounts")):
                 d = os.path.abspath(d)
-                if d != here and os.path.isdir(d) and d not in cands:
-                    cands.append(d)
-    for other in cands:
-        src_acc = os.path.join(other, "wg_accounts")
-        if glob.glob(os.path.join(src_acc, "*", "*.conf")):
-            shutil.copytree(src_acc, acc, dirs_exist_ok=True)
-            print(f"[WG] ก๊อปกุญแจ Windscribe จาก {src_acc} มาแล้ว")
-            return
-        confs = glob.glob(os.path.join(other, "wg", "*.conf"))
-        if confs:
-            os.makedirs(os.path.join(acc, "_backup"), exist_ok=True)
-            shutil.copy2(confs[0], os.path.join(acc, "_backup", "key.conf"))
-            print(f"[WG] ใช้กุญแจจาก {confs[0]} (เก็บไว้ที่ wg_accounts/_backup/key.conf)")
-            return
-    print(f"[WG] ไม่เจอกุญแจ Windscribe - หาใน: {', '.join(cands) or '(ไม่เจอโฟลเดอร์ main เลย)'}")
+                if d not in seen and not d.startswith(here + os.sep) and glob.glob(os.path.join(d, "*", "*.conf")):
+                    seen.add(d); found_acc.append(d)
+            for c in glob.glob(os.path.join(*mid, "wg", "*.conf")):
+                c = os.path.abspath(c)
+                if not c.startswith(here + os.sep):
+                    found_wg.append(c)
+    if found_acc:
+        shutil.copytree(found_acc[0], acc, dirs_exist_ok=True)
+        print(f"[WG] ก๊อปกุญแจ Windscribe จาก {found_acc[0]} มาแล้ว")
+        return True
+    if found_wg:
+        os.makedirs(os.path.join(acc, "_backup"), exist_ok=True)
+        shutil.copy2(found_wg[0], os.path.join(acc, "_backup", "key.conf"))
+        print(f"[WG] ใช้กุญแจจาก {found_wg[0]} (เก็บไว้ที่ wg_accounts/_backup/key.conf)")
+        return True
+    print(f"[WG] ไม่เจอกุญแจ Windscribe เลย (หาใน {', '.join(bases)} ลึก 3 ชั้น)")
+    return False
+
+
+_WG_NO_KEYS = False
 
 
 def wg_startup(devices):
     """ก่อนเริ่มบอท: ล้างการจอง/รายชื่อบล็อกเก่า, ล้างเน็ตทุกจอ, สร้างไฟล์ IP ให้พอ, เปิดตัวเฝ้า wg/"""
-    _wg_import_keys_from_main()
+    global _WG_NO_KEYS
+    if int(config.get("wg_enabled", 1) or 0) and not _wg_import_keys_from_main():
+        # ไม่มีกุญแจ = สร้างไฟล์ IP ไม่ได้แน่นอน -> ปิด VPN ทั้งรอบนี้ เล่นด้วยเน็ตปกติ (ไม่วนรีสตาร์ทไอดี)
+        _WG_NO_KEYS = True
+        config["wg_enabled"] = 0
+        print("[WG] ปิด VPN รอบนี้ - เล่นด้วยเน็ตปกติ (วางไฟล์ .conf ไว้ที่ wg_accounts/account1/ แล้วเปิดบอทใหม่)")
     cleanup_count = 0
     # 2b. ล้างรายชื่อ IP ที่จดว่าโดนบล็อก/พักไว้จากรอบก่อน (wg_reset_blocked_on_start, default 1)
     #     กันรายชื่อที่จดผิดสะสมจนไม่มี IP ให้ใช้/สร้างใหม่ไม่ได้ - ตัวที่โดนจริงบอทจะทดสอบเจอใหม่เอง
@@ -852,6 +864,8 @@ class BotInstance:
             with open("configmain.json", "r") as f:
                 self.config = json.load(f)
             config.update(self.config)
+            if _WG_NO_KEYS:
+                config["wg_enabled"] = 0
         except:
             self.config = {"getclearquest": 0}
 
@@ -3758,10 +3772,16 @@ class BotInstance:
 
                             def spam_heroes():
                                 self.log(f"[Machine-Gun] Tapping started!")
-                                burst_coords = hero_coords * 2
-                                tap_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in burst_coords]) + " & wait"
+                                # 8-star heroes first every burst; the 6-star ones only every 3rd burst
+                                strong_coords = [(483, 508), (582, 515), (683, 517), (146, 483)]
+                                weak_coords = [(278, 521), (384, 514)]
+                                strong_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in strong_coords * 2]) + " & wait"
+                                weak_chain = " & ".join([f"input tap {c[0]} {c[1]}" for c in weak_coords]) + " & wait"
+                                burst_n = 0
                                 while not stop_spam:
-                                    subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", tap_chain], **self.kwargs)
+                                    burst_n += 1
+                                    chain = strong_chain if burst_n % 3 else f"{strong_chain}; {weak_chain}"
+                                    subprocess.run([self.adb_cmd, "-s", self.device_id, "shell", chain], **self.kwargs)
                                     # See TAP_BURST_INTERVAL: paces process spawns, not taps.
                                     time.sleep(TAP_BURST_INTERVAL)
 
