@@ -617,8 +617,16 @@ def _wg_import_keys_from_main():
     acc = os.path.join(here, "wg_accounts")
     if glob.glob(os.path.join(acc, "*", "*.conf")):
         return
-    for name in ("main", "LGR"):
-        other = os.path.join(os.path.dirname(here), name)
+    # main อาจอยู่ข้าง play150 หรือบน Desktop (autoupdate-lg ติดตั้งเป็น <โฟลเดอร์>\main ซ้อนอีกชั้น)
+    bases = [os.path.dirname(here), os.path.join(os.path.expanduser("~"), "Desktop")]
+    cands = []
+    for b in bases:
+        for pat in ("main", "LGR", os.path.join("main", "main"), os.path.join("*", "main"), os.path.join("LGR", "main")):
+            for d in glob.glob(os.path.join(b, pat)):
+                d = os.path.abspath(d)
+                if d != here and os.path.isdir(d) and d not in cands:
+                    cands.append(d)
+    for other in cands:
         src_acc = os.path.join(other, "wg_accounts")
         if glob.glob(os.path.join(src_acc, "*", "*.conf")):
             shutil.copytree(src_acc, acc, dirs_exist_ok=True)
@@ -630,7 +638,7 @@ def _wg_import_keys_from_main():
             shutil.copy2(confs[0], os.path.join(acc, "_backup", "key.conf"))
             print(f"[WG] ใช้กุญแจจาก {confs[0]} (เก็บไว้ที่ wg_accounts/_backup/key.conf)")
             return
-    print("[WG] ไม่เจอกุญแจ Windscribe ทั้งใน play150 และโฟลเดอร์ main ข้าง ๆ")
+    print(f"[WG] ไม่เจอกุญแจ Windscribe - หาใน: {', '.join(cands) or '(ไม่เจอโฟลเดอร์ main เลย)'}")
 
 
 def wg_startup(devices):
