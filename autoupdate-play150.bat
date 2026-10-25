@@ -108,6 +108,9 @@ if exist "%SOURCE_FOLDER%\backup" rd /s /q "%SOURCE_FOLDER%\backup"
 if exist "%SOURCE_FOLDER%\backup-id" rd /s /q "%SOURCE_FOLDER%\backup-id"
 if exist "%SOURCE_FOLDER%\lv5+" rd /s /q "%SOURCE_FOLDER%\lv5+"
 if exist "%SOURCE_FOLDER%\logs" rd /s /q "%SOURCE_FOLDER%\logs"
+:: ไฟล์ IP (WireGuard) + กุญแจ Windscribe เป็นของแต่ละเครื่อง - ห้ามเขียนทับ
+if exist "%SOURCE_FOLDER%\wg" rd /s /q "%SOURCE_FOLDER%\wg"
+if exist "%SOURCE_FOLDER%\wg_accounts" rd /s /q "%SOURCE_FOLDER%\wg_accounts"
 
 :: adb\adb.exe มักโดนโปรแกรมจำลองล็อกไว้ (Sharing violation) - ถ้าเครื่องมี adb อยู่แล้ว
 :: ข้ามไปเลย ไม่งั้นการก๊อปจะพังกลางทางแล้วไฟล์ที่เหลือ (เช่น img\) ไม่ถูกอัปเดต

@@ -1,2 +1,7 @@
 backup/
 lv5+/
+
+# WireGuard: ไฟล์ IP + กุญแจ Windscribe ของแต่ละเครื่อง (ห้ามขึ้น GitHub)
+wg/
+wg_accounts/
+wg_new/

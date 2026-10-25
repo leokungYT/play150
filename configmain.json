@@ -10,5 +10,30 @@
     "ruby-gear200": 0,
     "random-gear": 0,
     "thread_delay": 5,
-    "HERO_MAPPING": {}
+    "HERO_MAPPING": {},
+    "wg_enabled": 1,
+    "wg_once": 0,
+    "wg_account": "account1",
+    "wg_machine": 1,
+    "wg_per_machine": 15,
+    "wg_total_machines": 30,
+    "wg_max_per_ip": 0,
+    "wg_cooldown_hours": 6,
+    "wg_probe": 1,
+    "wg_rotate_logins": 0,
+    "wg_regen_blocked": 1,
+    "wg_fixnet1_switch": 1,
+    "wg_auth_fallback": 0,
+    "wg_fixid_switch": 1,
+    "wg_net_recover_max": 10,
+    "wg_blocked_days": 7,
+    "wg_exclude_countries": [
+        "TH"
+    ],
+    "wg_after_login": 0,
+    "wg_dir": "wg",
+    "wg_per_device": {},
+    "wg_regen_every_min": 0,
+    "wg_required": 1,
+    "wg_lock": 0
 }
