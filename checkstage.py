@@ -610,8 +610,32 @@ def reset_network_all(devices):
 
 
 
+def _wg_import_keys_from_main():
+    """play150 ยังไม่มีกุญแจ Windscribe (wg_accounts/ ไม่ขึ้น git) -> ก๊อปจากโฟลเดอร์ main (LGR) ที่อยู่ข้างกัน
+    เอา wg_accounts/ ทั้งโฟลเดอร์ ; ถ้า main ไม่มี wg_accounts ใช้ไฟล์ .conf ใน main/wg/ 1 ไฟล์เป็นกุญแจสำรอง"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    acc = os.path.join(here, "wg_accounts")
+    if glob.glob(os.path.join(acc, "*", "*.conf")):
+        return
+    for name in ("main", "LGR"):
+        other = os.path.join(os.path.dirname(here), name)
+        src_acc = os.path.join(other, "wg_accounts")
+        if glob.glob(os.path.join(src_acc, "*", "*.conf")):
+            shutil.copytree(src_acc, acc, dirs_exist_ok=True)
+            print(f"[WG] ก๊อปกุญแจ Windscribe จาก {src_acc} มาแล้ว")
+            return
+        confs = glob.glob(os.path.join(other, "wg", "*.conf"))
+        if confs:
+            os.makedirs(os.path.join(acc, "_backup"), exist_ok=True)
+            shutil.copy2(confs[0], os.path.join(acc, "_backup", "key.conf"))
+            print(f"[WG] ใช้กุญแจจาก {confs[0]} (เก็บไว้ที่ wg_accounts/_backup/key.conf)")
+            return
+    print("[WG] ไม่เจอกุญแจ Windscribe ทั้งใน play150 และโฟลเดอร์ main ข้าง ๆ")
+
+
 def wg_startup(devices):
     """ก่อนเริ่มบอท: ล้างการจอง/รายชื่อบล็อกเก่า, ล้างเน็ตทุกจอ, สร้างไฟล์ IP ให้พอ, เปิดตัวเฝ้า wg/"""
+    _wg_import_keys_from_main()
     cleanup_count = 0
     # 2b. ล้างรายชื่อ IP ที่จดว่าโดนบล็อก/พักไว้จากรอบก่อน (wg_reset_blocked_on_start, default 1)
     #     กันรายชื่อที่จดผิดสะสมจนไม่มี IP ให้ใช้/สร้างใหม่ไม่ได้ - ตัวที่โดนจริงบอทจะทดสอบเจอใหม่เอง
