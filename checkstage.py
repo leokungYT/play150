@@ -1950,6 +1950,12 @@ class BotInstance:
                 img_array = np.frombuffer(result.stdout, np.uint8)
                 self.screen_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 self.screen_gray = cv2.cvtColor(self.screen_bgr, cv2.COLOR_BGR2GRAY)
+                # fixnet1 can pop up anywhere -> tap it first, on the fresh frame (one match, no extra capture)
+                pos_net1 = self.find_image("img/fixnet1.png")
+                if pos_net1:
+                    self.tap(pos_net1[0], pos_net1[1], label="fixnet1.png")
+                    time.sleep(2)
+                    self._raw_capture()
                 return True
         except Exception as e:
             self.log(f"Capture error: {e}")
@@ -2087,12 +2093,7 @@ class BotInstance:
             time.sleep(2)
             found_any = True
 
-        # fixnet1.png: Secondary Connection Error
-        if self.exists_in_cache("img/fixnet1.png"):
-            self.log(f"[POPUP] fixnet1.png detected! Tapping (476, 394)...")
-            self.tap(476, 394)
-            time.sleep(2)
-            found_any = True
+        # fixnet1.png is handled right after every screencap in capture_screen()
 
         # fixnetv3.png: Force Restart Loop
         if self.exists_in_cache("img/fixnetv3.png"):
