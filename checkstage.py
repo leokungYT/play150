@@ -3530,13 +3530,8 @@ class BotInstance:
                             if stage_num == 7:
                                 self.run_update_flow("Before Stage 7", timeout=60, finish_always=False)
 
-                            # fixback.png can show up before Stage 23 -> tap it if it appears
                             if stage_num == 23:
-                                self.log(f"Before Stage 23: searching for fixback.png (10s)...")
-                                if self.wait_and_click("img/fixback.png", timeout=10):
-                                    self.log(f"Clicked fixback.png before Stage 23.")
-                                    time.sleep(2)
-                                # Then tap fix-stage23-1 -> fix-stage23-2 before hunting num23
+                                # Tap fix-stage23-1 -> fix-stage23-2 before hunting num23
                                 for fix_img in ("img/fix-stage23-1.png", "img/fix-stage23-2.png"):
                                     self.log(f"Before Stage 23: searching for {fix_img} (10s)...")
                                     if self.wait_and_click(fix_img, timeout=10):
