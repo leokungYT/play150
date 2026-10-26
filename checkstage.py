@@ -3597,6 +3597,28 @@ class BotInstance:
                                         time.sleep(1)
                                         continue
 
+                                if not pos:
+                                    stage_notfound_count += 1
+                                    self.log(f"Stage {stage_num} image not found. (Retry: {stage_notfound_count}/10)")
+
+                                    # Stage 6 hidden 5 times in a row -> quest / 7day popup is usually in the way
+                                    if stage_num == 6 and stage_notfound_count >= 5:
+                                        self.log(f"Stage 6 not found 5 times -> Detour: quest -> BACK -> 7day -> mainstage...")
+                                        self.run_stage6_detour("Before Stage 6")
+                                        stage_notfound_count = 0
+
+                                    # Any stage stuck 10 times -> fix-stage23-1 -> fix-stage23-2, then hunt the same stage again
+                                    if stage_notfound_count >= 10:
+                                        self.log(f"Stage {stage_num} not found 10 times -> fix-stage23-1 -> fix-stage23-2...")
+                                        for fix_img in ("img/fix-stage23-1.png", "img/fix-stage23-2.png"):
+                                            if self.wait_and_click(fix_img, timeout=10):
+                                                self.log(f"Clicked {fix_img} (Stage {stage_num} recovery).")
+                                                time.sleep(2)
+                                        stage_notfound_count = 0
+
+                                    time.sleep(1)
+                                    continue
+
                                 if pos:
                                     if stage_num == 31:
                                         self.log(f"Entering STAGE 31+ LOOP SYSTEM...")
@@ -3750,13 +3772,7 @@ class BotInstance:
                                             break
 
                                     stage_notfound_count += 1
-                                    self.log(f"Stage {stage_num} image not found. (Retry: {stage_notfound_count}/5)")
-
-                                    # Stage 6 hidden 5 times in a row -> quest / 7day popup is usually in the way
-                                    if stage_num == 6 and stage_notfound_count >= 5:
-                                        self.log(f"Stage 6 not found 5 times -> Detour: quest -> BACK -> 7day -> mainstage...")
-                                        self.run_stage6_detour("Before Stage 6")
-                                        stage_notfound_count = 0
+                                    self.log(f"Stage {stage_num} start not found. (Retry: {stage_notfound_count}/5)")
 
                             hero_coords = [(278, 521), (384, 514), (483, 508), (582, 515), (683, 517), (146, 483)]
 
