@@ -3536,6 +3536,12 @@ class BotInstance:
                                 if self.wait_and_click("img/fixback.png", timeout=10):
                                     self.log(f"Clicked fixback.png before Stage 23.")
                                     time.sleep(2)
+                                # Then tap fix-stage23-1 -> fix-stage23-2 before hunting num23
+                                for fix_img in ("img/fix-stage23-1.png", "img/fix-stage23-2.png"):
+                                    self.log(f"Before Stage 23: searching for {fix_img} (10s)...")
+                                    if self.wait_and_click(fix_img, timeout=10):
+                                        self.log(f"Clicked {fix_img} before Stage 23.")
+                                        time.sleep(2)
 
                             self.log(f"=== TARGET STAGE: {stage_num} (IMAGE) ===")
 
